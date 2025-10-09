@@ -1,0 +1,345 @@
+import pandas as pd
+import numpy as np
+import os
+import gzip
+import csv
+import glob
+import shutil
+import subprocess
+import json
+import re
+from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from itertools import islice
+from tqdm import tqdm
+
+# --- External Tool Imports ---
+# NOTE: This script assumes 'Biopython', 'regex', 'edlib', and 'vsearch' are installed.
+try:
+    from Bio import SeqIO, SeqRecord, Seq
+    import regex
+    import edlib
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    USE_FUZZY_MATCH = True
+except ImportError:
+    print("FATAL ERROR: Required libraries (Biopython, regex, edlib, seaborn) are missing.")
+    USE_FUZZY_MATCH = False
+    # Define placeholder for plotting to prevent errors in final stages
+    plt = type('obj', (object,), {'figure': lambda *a, **kw: None, 'show': lambda: None})()
+    sns = type('obj', (object,), {'boxplot': lambda *a, **kw: None, 'barplot': lambda *a, **kw: None})()
+    
+try:
+    subprocess.run(["vsearch", "--version"], check=True, capture_output=True)
+    VSEARCH_AVAILABLE = True
+except (FileNotFoundError, subprocess.CalledProcessError):
+    print("WARNING: 'vsearch' command not found. Clustering step will be skipped.")
+    VSEARCH_AVAILABLE = False
+
+
+# =============================================================================
+# 1. CONFIGURATION AND PATHS (UPDATE THESE)
+# =============================================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
+
+# --- INPUT & EXTERNAL FILES (Place these in your 'data/' folder) ---
+ILLUMINA_RAW_FASTQ = os.path.join(BASE_DIR, "data/raw/Illumina_merged_raw.fastq.gz")
+NANOPORE_CLEAN_CSV = os.path.join(BASE_DIR, "data/input/GGS2_Nanopore_Assembly_CLEAN.csv")
+ILLUMINA_LFC_METADATA_CSV = os.path.join(BASE_DIR, "data/input/Illumina_LFC_metadata.csv")
+FASTA_FILE = os.path.join(BASE_DIR, "data/input/GGS2_Reference_of_parts.fasta") 
+
+# --- PROCESSING FILES (Intermediate Outputs) ---
+FILTERED_FASTQ = os.path.join(BASE_DIR, "processed/illumina_filtered.fastq.gz")
+BARCODE_COUNTS_CSV = os.path.join(BASE_DIR, "processed/illumina_barcodes_counts.csv")
+BARCODE_UNIQUE_FASTA = os.path.join(BASE_DIR, "processed/illumina_unique_barcodes.fasta")
+VSEARCH_OUT_UC = os.path.join(BASE_DIR, "logs/illumina_clusters.uc")
+CLUSTER_SUMMARY_CSV = os.path.join(BASE_DIR, "processed/illumina_cluster_summary.csv")
+OUTPUT_MERGED_CSV = os.path.join(BASE_DIR, "processed/GGS2_Assembly_Barcode_Cluster_Matches.csv")
+
+# --- FINAL OUTPUT ---
+OUTPUT_LFC_CSV = os.path.join(BASE_DIR, "final/Final_Assembly_LFC_Summary_w_Features.csv")
+
+# --- Global & Fixed Parameters ---
+MIN_LEN, MAX_LEN = 183, 183
+MAX_ERROR = 2
+N_WORKERS = 8
+BACKBONE_SIZE = 2131
+COUNT_COLS = ["Count in Start", "Count in End-1", "Count in End-2", "Count in End-3"]
+
+# --- Illumina Extraction Constants ---
+LEFT_FLANK = "CCGCTTGCTT"
+RIGHT_FLANK = "AGCAACTCTC"
+MOTIF_PATTERN = r"^NNNANNTNNNANNNANNTNNN$"
+LEFT_START, LEFT_END = 68, 78
+RIGHT_START, RIGHT_END = 99, 109
+BARCODE_START, BARCODE_END = LEFT_END, RIGHT_START
+
+
+# =============================================================================
+# 2. ILLUMINA PROCESSING STAGES (Filter, Extract, Cluster)
+# =============================================================================
+
+def matches_flank(seq_segment, target_flank, max_err=1):
+    """Checks flank match using fuzzy regex matching."""
+    return bool(regex.fullmatch(f"({target_flank}){{e<={max_err}}}", seq_segment))
+
+def run_illumina_filter_extract_cluster():
+    """Runs size filtering, fixed-position barcode extraction, and VSEARCH clustering."""
+    
+    # 2A. Size Filter
+    print("--- Stage 1: Size Filtering and Extraction ---")
+    total_in, total_out = 0, 0
+    with gzip.open(ILLUMINA_RAW_FASTQ, "rt") as infile, gzip.open(FILTERED_FASTQ, "wt") as outfile:
+        for rec in tqdm(SeqIO.parse(infile, "fastq"), desc="1a. Filtering reads"):
+            total_in += 1
+            if MIN_LEN <= len(rec.seq) <= MAX_LEN:
+                SeqIO.write(rec, outfile, "fastq")
+                total_out += 1
+    
+    # 2B. Barcode Extraction
+    MOTIF_REGEX = regex.compile(MOTIF_PATTERN.replace("N", "[ATGC]"))
+    barcode_counter = Counter()
+
+    with gzip.open(FILTERED_FASTQ, "rt") as fq:
+        for rec in tqdm(SeqIO.parse(fq, "fastq"), desc="1b. Extracting barcodes"):
+            seq = str(rec.seq).strip()
+            if len(seq) < BARCODE_END: continue
+
+            left_seq = seq[LEFT_START:LEFT_END]
+            right_seq = seq[RIGHT_START:RIGHT_END]
+            barcode_region = seq[BARCODE_START:BARCODE_END]
+
+            if not (matches_flank(left_seq, LEFT_FLANK, 1) and matches_flank(right_seq, RIGHT_FLANK, 1)):
+                continue
+            if len(barcode_region) == 21 and MOTIF_REGEX.match(barcode_region):
+                barcode_counter[barcode_region] += 1
+                
+    # 2C. Save unique barcodes
+    with open(BARCODE_COUNTS_CSV, "w", newline="") as csvfile, \
+         open(BARCODE_UNIQUE_FASTA, "w") as outfa:
+        writer = csv.writer(csvfile)
+        writer.writerow(["barcode_id", "sequence", "count"])
+        
+        for i, (bc, cnt) in enumerate(barcode_counter.most_common(), 1):
+            bc_id = f"barcode_{i}"
+            writer.writerow([bc_id, bc, cnt])
+            outfa.write(f">{bc_id}\n{bc}\n")
+
+    # 2D. VSEARCH Clustering
+    print("\n--- 1c. VSEARCH Clustering ---")
+    if not VSEARCH_AVAILABLE:
+        print("❌ Clustering skipped. VSEARCH not found.")
+        return None
+    
+    if not os.path.exists(VSEARCH_OUT_UC):
+        subprocess.run(["vsearch", "--cluster_fast", BARCODE_UNIQUE_FASTA, "--id", "0.9",
+                        "--minseqlength", "21", "--centroids", VSEARCH_OUT_FA, "--uc", VSEARCH_OUT_UC, "--strand", "both"], 
+                       capture_output=True, text=True, check=False)
+    
+    # Parse clustering results
+    cluster_members = defaultdict(list)
+    with open(VSEARCH_OUT_UC) as f:
+        for line in f:
+            if not line.startswith("#"):
+                fields = line.strip().split("\t")
+                if fields[0] in ("S", "H"):
+                    target = fields[9] if fields[0] == "H" else fields[8]
+                    cluster_members[target].append(fields[8])
+    
+    # Finalize summary table
+    df_cluster_list = []
+    header2seq = {rec.id.split()[0]: str(rec.seq) for rec in SeqIO.parse(BARCODE_UNIQUE_FASTA, "fasta")}
+    
+    for centroid, members in cluster_members.items():
+        member_counts = [barcode_counter.get(m, 0) for m in members]
+        if len(members) == 1 and member_counts[0] == 1: continue # Filter singletons with count=1
+
+        df_cluster_list.append({
+            "Cluster ID": centroid,
+            "Cluster Sequence": header2seq.get(centroid, ""),
+            "num_barcodes_in_cluster": len(members),
+            "total_reads_in_cluster": sum(member_counts)
+        })
+        
+    df_cluster_summary = pd.DataFrame(df_cluster_list)
+    df_cluster_summary.to_csv(CLUSTER_SUMMARY_CSV, index=False)
+    print(f"✅ Stage 1 Complete. Cluster summary written.")
+    return df_cluster_summary
+
+# =============================================================================
+# 3. MERGE, LFC, AND FEATURE CALCULATION
+# =============================================================================
+
+def calculate_rpm_and_lfc(df, count_cols):
+    """Computes RPM and LFC with imputation."""
+    
+    # Filter out assemblies with zero counts across all samples
+    df = df[(df[count_cols].astype(float) > 0).any(axis=1)].copy()
+    
+    for col in count_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    
+    total_reads = {col: df[col].sum() for col in count_cols}
+    
+    # Compute RPM (RPM = (count + 1) / total_reads * 1e6)
+    df["RPM_Start"] = (df["Count in Start"].astype(float) + 1) / total_reads["Count in Start"] * 1e6
+    df["RPM_End1"]  = (df["Count in End-1"].astype(float)  + 1) / total_reads["Count in End-1"] * 1e6
+    df["RPM_End2"]  = (df["Count in End-2"].astype(float)  + 1) / total_reads["Count in End-2"] * 1e6
+    df["RPM_End3"]  = (df["Count in End-3"].astype(float)  + 1) / total_reads["Count in End-3"] * 1e6
+
+    # Impute single-zero replicates
+    masks = {
+        'End1': (df["Count in End-1"] == 0) & (df["Count in End-2"] > 0) & (df["Count in End-3"] > 0),
+        'End2': (df["Count in End-2"] == 0) & (df["Count in End-1"] > 0) & (df["Count in End-3"] > 0),
+        'End3': (df["Count in End-3"] == 0) & (df["Count in End-1"] > 0) & (df["Count in End-2"] > 0)
+    }
+
+    df.loc[masks['End1'], "RPM_End1"] = (df.loc[masks['End1'], "RPM_End2"] + df.loc[masks['End1'], "RPM_End3"]) / 2
+    df.loc[masks['End2'], "RPM_End2"] = (df.loc[masks['End2'], "RPM_End1"] + df.loc[masks['End2'], "RPM_End3"]) / 2
+    df.loc[masks['End3'], "RPM_End3"] = (df.loc[masks['End3'], "RPM_End1"] + df.loc[masks['End3'], "RPM_End2"]) / 2
+
+    # Compute LFC and Standard Deviation
+    df["LFC_End1"] = np.log2(df["RPM_End1"] / df["RPM_Start"])
+    df["LFC_End2"] = np.log2(df["RPM_End2"] / df["RPM_Start"])
+    df["LFC_End3"] = np.log2(df["RPM_End3"] / df["RPM_Start"])
+    
+    lfc_cols = ["LFC_End1", "LFC_End2", "LFC_End3"]
+    df["LFC_mean"] = df[lfc_cols].mean(axis=1)
+    df["LFC_std"] = df[lfc_cols].std(axis=1, ddof=0)
+    
+    return df
+
+def parse_fasta_info(fasta_path):
+    """Parses FASTA file to extract size and GC% for each part."""
+    part_info = {}
+    if not os.path.exists(fasta_path): return part_info
+         
+    for record in SeqIO.parse(fasta_path, "fasta"):
+        seq = str(record.seq).upper()
+        if len(seq) > 0:
+            gc = 100.0 * (seq.count("G") + seq.count("C")) / len(seq)
+            part_info[record.id] = {"size": len(seq), "gc": gc}
+    return part_info
+
+def compute_assembly_features(df, part_info, backbone_size):
+    """Calculates total assembly size and GC content by aggregating individual parts."""
+    
+    ref_cols = [col for col in df.columns if ('Reference' in col or 'Part Name' in col) and 'Position' in col]
+    
+    def aggregate_features(row):
+        assembly_size, gc_total = 0, 0
+        
+        # Aggregate features by looking up each Part's Reference ID
+        for part_id in row[ref_cols].dropna():
+            info = part_info.get(part_id)
+            
+            if info:
+                assembly_size += info["size"]
+                gc_total += info["gc"] * info["size"] / 100
+                
+        plasmid_size = assembly_size + backbone_size
+        gc_percent = 100 * gc_total / assembly_size if assembly_size > 0 else np.nan
+        
+        return pd.Series({
+            "Assembly_Size_bp": assembly_size,
+            "Plasmid_Size_bp": plasmid_size,
+            "Assembly_GC_pct": gc_percent
+        })
+
+    feature_df = df.apply(aggregate_features, axis=1)
+    df = pd.concat([df.reset_index(drop=True), feature_df], axis=1)
+    return df
+
+def run_cross_platform_merge_and_calculate(df_cluster_summary):
+    """Orchestrates the final merge, LFC calculation, and feature engineering."""
+    print("\n--- Stage 2: Cross-Platform Merge and LFC Calculation ---")
+    
+    # 1. Load Data
+    if not os.path.exists(NANOPORE_CLEAN_CSV) or not os.path.exists(ILLUMINA_LFC_METADATA_CSV):
+        print("FATAL: Missing input files. Cannot merge.")
+        return None
+        
+    df_nano = pd.read_csv(NANOPORE_CLEAN_CSV, dtype=str)
+    df_lfc_meta = pd.read_csv(ILLUMINA_LFC_METADATA_CSV)
+    df_cluster_summary = df_cluster_summary.rename(columns={"Cluster Sequence": "matched_cluster_seq"})
+    
+    # Prepare Nanopore barcodes for matching
+    barcode_col_nano = [col for col in df_nano.columns if "barcode" in col.lower() or "sequence" in col.lower()][0]
+    df_nano = df_nano[df_nano[barcode_col_nano].notna()].copy()
+    
+    unique_nanopore_barcodes = df_nano[barcode_col_nano].unique().tolist()
+    cluster_seqs = df_cluster_summary["matched_cluster_seq"].astype(str).tolist()
+
+    # 2. Fuzzy Matching Execution
+    matches = []
+    if USE_FUZZY_MATCH:
+        with ProcessPoolExecutor(max_workers=N_WORKERS) as executor:
+            futures = {executor.submit(match_barcode_best, bc, cluster_seqs, MAX_ERROR): bc 
+                       for bc in unique_nanopore_barcodes}
+            pbar = tqdm(total=len(futures), desc="2a. Fuzzy-matching barcodes")
+            for fut in as_completed(futures):
+                matches.append(fut.result())
+                pbar.update(1)
+        df_matches = pd.DataFrame(matches, columns=[barcode_col_nano, "matched_cluster_seq", "edit_distance"])
+    else:
+        print("❌ Skipping fuzzy match due to missing dependencies.")
+        df_matches = pd.DataFrame(columns=[barcode_col_nano, "matched_cluster_seq", "edit_distance"])
+
+    # 3. Merge all data sources
+    df_annotated = pd.merge(df_nano, df_matches, on=barcode_col_nano, how="left")
+    
+    # Merge cluster info and LFC metadata
+    df_count_merged = pd.merge(df_annotated, df_cluster_summary, on="matched_cluster_seq", how="left")
+    df_count_merged = pd.merge(df_count_merged, df_lfc_meta, on="Cluster ID", how="left", suffixes=('_cluster', ''))
+
+    # 4. Calculate RPM/LFC
+    df_lfc = calculate_rpm_and_lfc(df_count_merged, COUNT_COLS)
+    
+    # 5. Calculate Features
+    part_info = parse_fasta_info(FASTA_FILE)
+    df_final = compute_assembly_features(df_lfc, part_info, BACKBONE_SIZE)
+    
+    return df_final
+
+
+# =============================================================================
+# 4. MAIN EXECUTION BLOCK
+# =============================================================================
+
+def main_pipeline_run():
+    """Main function to orchestrate the entire pipeline."""
+    
+    # --- Setup directories ---
+    for d in ["raw", "processed", "results", "logs", "input", "final"]:
+        os.makedirs(os.path.join(BASE_DIR, d), exist_ok=True)
+    
+    if not os.path.exists(ILLUMINA_RAW_FASTQ):
+        print(f"FATAL: Raw Illumina input file not found at {ILLUMINA_RAW_FASTQ}. Exiting.")
+        return
+
+    # 1. Run Illumina Processing (Filtering, Extraction, Clustering)
+    df_cluster_summary = run_illumina_filter_extract_cluster()
+    
+    # 2. Run Cross-Platform Merge and LFC Calculation
+    if df_cluster_summary is not None:
+        df_final_data = run_cross_platform_merge_and_calculate(df_cluster_summary)
+        
+        if df_final_data is not None:
+            # 3. Final Export
+            lfc_cols = [col for col in df_final_data.columns if any(s in col for s in ['Position', 'barcode', 'LFC_', 'Size', 'GC', 'Count in Start'])]
+            df_final_data[lfc_cols].to_csv(OUTPUT_LFC_CSV, index=False)
+            print("-" * 40)
+            print(f"SUCCESS: Final LFC and Feature Summary saved to {OUTPUT_LFC_CSV}")
+            
+            # 4. LFC Distribution Plot (Final Validation)
+            plt.figure(figsize=(6, 4))
+            plt.hist(df_final_data["LFC_mean"].dropna(), bins=50, edgecolor="black", alpha=0.75, color='lightblue', zorder=3)
+            plt.title("Distribution of Log Fold Change")
+            plt.xlabel("Log Fold Change (LFC)")
+            plt.ylabel("Number of Assemblies")
+            plt.grid(True, alpha=0.7, zorder=1)
+            plt.tight_layout()
+            plt.show()
+
+if __name__ == "__main__":
+    main_pipeline_run()

@@ -1,1 +1,163 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+import re
+from scipy import stats
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import OneHotEncoder, PolynomialFeatures
+from sklearn.metrics import mean_squared_error, r2_score
+import shap
 
+# --- 1. Load Data ---
+# NOTE FOR GITHUB USER: Replace 'PATH_TO_YOUR_DATA' with the actual path
+# to your dataset file: Four_Part_Assembly_LFC_Dataset.csv
+DATASET_NAME = 'Four_Part_Assembly_LFC_Dataset.csv'
+
+# --- Data Loading Logic ---
+try:
+    # Attempt to load the data using a common relative path
+    Path = f'data/{DATASET_NAME}' 
+    dataframe = pd.read_csv(Path)
+except FileNotFoundError:
+    # --- Dummy Data Generator (for demonstration or testing) ---
+    print(f"WARNING: Data file '{DATASET_NAME}' not found at the expected path.")
+    print("Using dummy data structure for demonstration purposes.")
+    np.random.seed(42)
+    # Creating a DataFrame that mimics the structure required by the pipeline
+    dataframe = pd.DataFrame({
+        "Position 1": np.random.choice(["P1_A", "P1_B", "P1_C"], 100),
+        "Position 2": np.random.choice(["P2_X", "P2_Y"], 100),
+        "Position 3": np.random.choice(["P3_M", "P3_N", "P3_P"], 100),
+        "Position 4": np.random.choice(["P4_R", "P4_S"], 100),
+        "Average": np.random.rand(100) * 5  # The target variable
+    })
+
+# --- 2. Define Features and Target ---
+X = dataframe.drop("Average", axis=1)
+y = dataframe["Average"]
+categorical_features = ["Position 1", "Position 2", "Position 3", "Position 4"]
+
+
+# --- 3. Build Model Pipeline ---
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("onehot", OneHotEncoder(handle_unknown='ignore'), categorical_features)
+    ],
+    remainder='drop'
+)
+
+# Pipeline includes OHE, Polynomial Features for interactions, and RandomForest
+model = make_pipeline(
+    preprocessor,
+    PolynomialFeatures(interaction_only=True, include_bias=False),
+    RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+)
+
+# --- 4. Split Data and Train Model ---
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+print("\nTraining Random Forest Regressor...")
+model.fit(X_train, y_train)
+
+# --- 5. Evaluate Performance ---
+y_pred = model.predict(X_test)
+r2 = r2_score(y_test, y_pred)
+cv_scores = cross_val_score(model, X, y, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+mean_cv_mse = -np.mean(cv_scores)
+
+print("\n--- Model Metrics ---")
+print(f"R-squared Score (R2): {r2:.4f}")
+print(f"Mean Cross-Validation MSE (5-fold): {mean_cv_mse:.4f}")
+
+
+# --- 6. Diagnostic Plots (Residuals) ---
+residuals = y_test - y_pred
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 5), dpi=100)
+
+# Plot 1: Residuals vs. Predicted Values
+sns.scatterplot(x=y_pred, y=residuals, ax=axes[0], alpha=0.6)
+axes[0].axhline(y=0, color='r', linestyle='--')
+axes[0].set_xlabel('Predicted Values')
+axes[0].set_ylabel('Residuals')
+axes[0].set_title('Residuals vs. Predicted Values')
+axes[0].grid(axis='both', linestyle=':', alpha=0.6)
+
+# Plot 2: Q-Q Plot of Residuals
+stats.probplot(residuals, dist="norm", plot=axes[1])
+axes[1].set_title('Q-Q Plot')
+axes[1].grid(axis='both', linestyle=':', alpha=0.6)
+
+plt.tight_layout()
+plt.show()
+
+# --- 7. SHAP Analysis: Model Interpretability ---
+
+# SHAP (SHapley Additive exPlanations) is used to explain the model's predictions by
+# quantifying the contribution of each feature (parts and their interactions) to the
+# predicted output for every single observation. This helps identify which components
+# drive performance up or down.
+
+print("\nStarting SHAP Analysis...")
+
+# Extract components needed for SHAP
+rf_model = model.named_steps['randomforestregressor']
+poly_features = model.named_steps['polynomialfeatures']
+feature_names = poly_features.get_feature_names_out(model.named_steps['columntransformer'].named_transformers_['onehot'].get_feature_names_out(categorical_features))
+X_poly = poly_features.transform(model.named_steps['columntransformer'].transform(X))
+
+# Handle sparse matrix output if present
+if hasattr(X_poly, "toarray"):
+    X_poly = X_poly.toarray()
+
+# Build Explainer and calculate SHAP values
+explainer = shap.TreeExplainer(rf_model)
+shap_values = explainer.shap_values(X_poly)
+
+# --- Plot A: Feature Importance (Mean Absolute SHAP) ---
+# Shows the average magnitude of impact each feature has on the prediction.
+plt.figure(figsize=(10, 6))
+shap.summary_plot(
+    shap_values,
+    X_poly,
+    feature_names=feature_names,
+    plot_type="bar",
+    max_display=10,
+    show=False
+)
+plt.title("Feature Importance (Mean Absolute SHAP Value)")
+plt.tight_layout()
+plt.show()
+
+# --- Plot B: SHAP Dependence Plot for the most influential feature ---
+# This plot reveals the relationship between the top feature's value and its impact
+# on the model's prediction, showing potential non-linear effects or interactions.
+
+# Find the index of the most influential feature
+mean_abs_shap = np.abs(shap_values).mean(axis=0)
+top_idx = np.argmax(mean_abs_shap)
+top_feature_name = feature_names[top_idx]
+
+plt.figure(figsize=(8, 6))
+shap.dependence_plot(
+    top_feature_name,
+    shap_values,
+    X_poly,
+    feature_names=feature_names,
+    interaction_index="auto",
+    show=False
+)
+plt.title(f"SHAP Dependence Plot: {top_feature_name}")
+plt.tight_layout()
+plt.show()
+
+# --- 8. Save the Trained Model ---
+# joblib.dump(model, "models/assembly_rf_pipeline.joblib")
+# print(f"\nModel saved successfully.")

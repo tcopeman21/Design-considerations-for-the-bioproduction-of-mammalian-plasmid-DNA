@@ -1,0 +1,240 @@
+import re
+import textwrap
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import math
+from itertools import combinations
+from scipy.stats import mannwhitneyu, chi2_contingency
+from collections import defaultdict
+import os
+
+# =============================================================================
+# 1. CONFIGURATION AND PATHS (UPDATE THESE)
+# =============================================================================
+# NOTE: Replace 'BASE_DIR' if your script is not in the repository root.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
+
+# --- Input Files (Assumes they are in the 'data/results' folder) ---
+PAIRWISE_CSV = os.path.join(BASE_DIR, "data/results/Pairwise_Ablation_Results_KFold.csv")
+BIO_CSV      = os.path.join(BASE_DIR, "data/results/Bio_3_Feature_Ablation.csv")
+
+# --- Figure Options ---
+TOP_N_WINNERS = 18    # Max number of bars to show on the Delta panel
+WRAP_CHARS    = 48    # Max characters before wrapping Y-axis labels
+PASTEL_BLUE   = "#4A90E2" 
+
+
+# =============================================================================
+# 2. DATA LOADING AND CANONICALIZATION
+# =============================================================================
+
+def load_and_prepare_data(pairwise_path, bio_path):
+    """Loads CSVs, cleans headers, and combines the two ablation result sets."""
+    
+    def _normcols(df): return df.rename(columns={c: c.strip() for c in df.columns})
+
+    df_dna = _normcols(pd.read_csv(pairwise_path))
+    df_bio = _normcols(pd.read_csv(bio_path))
+    
+    # Check for required columns
+    for c in ["Features", "Mean Spearman R"]:
+        if c not in df_dna.columns or c not in df_bio.columns:
+            print(f"FATAL: Missing column '{c}' in input CSVs.")
+            return None
+
+    df_dna["Source"] = "DNABERT"
+    df_bio["Source"] = "BIO"
+
+    # Define feature groups
+    design_feats = ["Total_TX_Sites", "Total_TX_Strength", "Total_TL_Sites", "Total_TL_Strength", 
+                    "Number of unique E.coli motifs", "Number of total e.coli motif sites", "GC_percent"]
+    physical_feats = ["sequence_length", "DH5a_Average_Concatemer_Percentage", "DH5a_Average_Concat_Fold_Increase"]
+    
+    design_set, physical_set = set(design_feats), set(physical_feats)
+    
+    # Expand shorthand rows (like "All Bio") in the BIO CSV
+    df_bio["Features"] = df_bio["Features"].replace({
+        "Design: All": "+".join(sorted(design_feats)),
+        "Physical: All": "+".join(sorted(physical_feats)),
+        "All Bio": "+".join(sorted(design_feats + physical_feats)),
+    })
+
+    df = pd.concat([df_dna, df_bio], ignore_index=True)
+    
+    # Canonical key for combining identical feature sets (e.g., "A+B" == "B+A")
+    def canonical_key_bio(feat_str: str) -> str:
+        t = str(feat_str).strip().replace(' only', '').replace('Combo: ', '')
+        t = t.replace('DNABERT + ', '').replace('DNABERT+', '').replace('DNABERT', '')
+        parts = [p.strip() for p in t.split('+') if p.strip()]
+        return '+'.join(sorted(parts))
+
+    # Clean display label (for the bar chart Y-axis)
+    df["Features_disp"] = (df["Features"].astype(str)
+                             .str.replace(r'^\s*Combo:\s*', '', regex=True)
+                             .str.replace(r'\s+only\s*$', '', regex=True)
+                             .str.replace(r'\s+', ' ', regex=True).str.strip())
+    
+    df["feat_key"] = df["Features"].apply(canonical_key_bio)
+    
+    # Feature Group Classification
+    def classify_combination(feat_str, source):
+        t = str(feat_str).strip()
+        if t == "DNABERT Only": return None
+        clean = t.replace(" only","").replace("DNABERT + ","").replace("Combo: ","")
+        parts = [p.strip() for p in clean.split("+") if p.strip()]
+        s = set(parts)
+        cats = [("Design" if p in design_set else "Physical" if p in physical_set else "Other") for p in parts]
+        
+        if source == "DNABERT" and "DNABERT + " in t: return f"{len(parts)}-feature + DNABERT"
+        if len(parts) == 1 and s.issubset(design_set | physical_set): return "1-feature Bio"
+        if len(parts) == 2 and s.issubset(design_set | physical_set):
+            sc = set(cats)
+            if sc == {"Design"}: return "2-feature Design"
+            if sc == {"Physical"}: return "2-feature Physical"
+            if sc == {"Design","Physical"}: return "2-feature Mixed"
+        if s == design_set | physical_set: return "All Bio"
+        if s == design_set: return "All Design"
+        if s == physical_set: return "All Physical"
+        return None
+
+    df["Custom Group"] = df.apply(lambda r: classify_combination(r["Features"], r["Source"]), axis=1)
+    df_plot = df[df["Custom Group"].notna()].copy()
+    
+    # Baseline
+    base_vals = df[df["Features"].astype(str).str.strip() == "DNABERT Only"]["Mean Spearman R"].values
+    baseline  = float(np.mean(base_vals)) if len(base_vals) else None
+    
+    return df, df_plot, baseline
+
+# =============================================================================
+# 3. PLOTTING HELPERS
+# =============================================================================
+
+def wrap_labels(series, width=WRAP_CHARS):
+    return ["\n".join(textwrap.wrap(str(x), width=width)) for x in series]
+
+def relabel_features(text: str) -> str:
+    """Converts internal feature codes (e.g., 'Total_TX_Sites') to readable names."""
+    s = str(text)
+    rules = [
+        (r'(?i)\bsequence_length\b', 'Size'),
+        (r'(?i)\bDH5a_Average_Concatemer[_ ]?Percentage\b', 'Concatemer %'),
+        (r'(?i)\bTotal_TL_Sites\b', 'No. of RBS'),
+        (r'(?i)\bTotal_TX_Sites\b', 'No. of TSS'),
+        (r'(?i)\bNumber of unique E\.?\s?coli (?:motifs|moitfs)\b', 'No. of TFBS'),
+        (r'(?i)\bNumber of total e\.?\s?coli motif sites\b', 'No. of total TFBS'),
+        (r'(?i)\bGC_percent\b', 'GC content'),
+        (r'(?i)\bTotal_TX_Strength\b', 'TX Strength'),
+        (r'(?i)\bTotal_TL_Strength\b', 'TL Strength'),
+    ]
+    for pat, rep in rules:
+        s = re.sub(pat, rep, s)
+    return s
+
+def ci95_from_values(vals):
+    """Calculates mean and 95% CI bounds from an array of values."""
+    a = np.asarray(vals, dtype=float)
+    a = a[~np.isnan(a)]
+    n = len(a)
+    if n < 2: return np.nan, np.nan, np.nan, n
+    mean = float(np.mean(a))
+    se   = float(np.std(a, ddof=1)/np.sqrt(n))
+    z = 1.96
+    return mean, mean - z*se, mean + z*se, n
+
+
+# =============================================================================
+# 4. PLOTTING LOGIC
+# =============================================================================
+
+def generate_ablation_plot(df, df_plot, baseline):
+    """Generates the final 2-panel figure for the ablation study."""
+    
+    # --- Data for Left Plot (Boxplot) ---
+    group_order = [
+        "2-feature + DNABERT", "1-feature + DNABERT",
+        "2-feature Mixed", "2-feature Physical", "2-feature Design",
+        "1-feature Bio", "All Physical", "All Design", "All Bio"
+    ]
+    
+    # Aggregate data: one value per unique combination (feat_key)
+    per_combo = (df_plot.groupby(["Custom Group", "feat_key"])["Mean Spearman R"].mean().reset_index())
+    box_data, tick_labels = [], []
+    for g in group_order:
+        vals = per_combo.loc[per_combo["Custom Group"] == g, "Mean Spearman R"].values
+        if len(vals) == 0: continue
+        box_data.append(vals)
+        tick_labels.append(f"{g} (n={len(vals)})")
+
+    # --- Data for Right Plot (Delta Bar Chart) ---
+    combos = df_plot.groupby("feat_key", as_index=False)["Mean Spearman R"].mean()
+    baseline_for_bar = baseline if baseline is not None else float(combos["Mean Spearman R"].median())
+    combos["delta_mean"] = combos["Mean Spearman R"] - baseline_for_bar
+    
+    # Winners only (positive delta)
+    winners = combos[combos["delta_mean"] > 0].sort_values("delta_mean", ascending=True)
+    if len(winners) > TOP_N_WINNERS: winners = winners.tail(TOP_N_WINNERS)
+    
+    # Attach readable label
+    winners["label"] = winners["feat_key"].apply(lambda key: ' + '.join(relabel_features(p) for p in key.split('+')))
+
+
+    # --- Setup Figure ---
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Set common visual styles
+    for ax in (ax1, ax2):
+        ax.xaxis.grid(True, linestyle=":", linewidth=0.7, zorder=0)
+        ax.set_axisbelow(True)
+        ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color("black"); ax.spines['bottom'].set_color("black")
+        ax.spines['left'].set_linewidth(1); ax.spines['bottom'].set_linewidth(1)
+
+
+    # ---- Left Panel: Boxplot (Spearman R Distribution) ----
+    positions = np.arange(len(box_data))[::-1] + 1
+    bp = ax1.boxplot(
+        box_data, vert=False, positions=positions, widths=0.6,
+        patch_artist=True, showfliers=False, medianprops=dict(color="black", linewidth=2), zorder=3
+    )
+    # Fill boxes with opaque pastel blue
+    for patch in bp['boxes']:
+        patch.set_facecolor(PASTEL_BLUE)
+        patch.set_alpha(1.0)
+    for element in ['whiskers', 'caps', 'medians']:
+        plt.setp(bp[element], color="black", linewidth=1)
+
+    if baseline is not None:
+        ax1.axvline(baseline, linestyle="--", linewidth=1.5, color="red", zorder=2)
+
+    ax1.set_yticks(positions)
+    ax1.set_yticklabels(tick_labels, fontsize=9)
+    ax1.set_xlabel("Spearman r")
+    ax1.set_title("Predictive performance by feature group")
+
+
+    # ---- Right Panel: Delta Bar Chart ----
+    ypos = np.arange(len(winners))
+    ax2.barh(ypos, winners["delta_mean"], align='center', color=PASTEL_BLUE, alpha=1.0, zorder=3)
+    ax2.axvline(0.0, linestyle="--", linewidth=1.5, color="red", zorder=2) # Delta = 0 baseline
+    
+    ax2.set_yticks(ypos)
+    ax2.set_yticklabels(wrap_labels(winners["label"], WRAP_CHARS), fontsize=8)
+    ax2.set_xlabel("Δ Spearman r vs DNABERT")
+    ax2.set_title("Feature combinations that outperform DNABERT")
+
+
+    plt.tight_layout(pad=0.6)
+    fig.subplots_adjust(wspace=0.35)
+    plt.show()
+
+# =============================================================================
+# 5. MAIN EXECUTION
+# =============================================================================
+
+if __name__ == "__main__":
+    df, df_plot, baseline = load_and_prepare_data(PAIRWISE_CSV, BIO_CSV)
+    if df is not None:
+        generate_ablation_plot(df, df_plot, baseline)

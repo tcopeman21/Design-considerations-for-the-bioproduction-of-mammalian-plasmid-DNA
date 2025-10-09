@@ -1,0 +1,559 @@
+import numpy as np
+import pandas as pd
+import gzip
+import os
+import csv
+import glob
+import re
+import json
+import shutil
+from datetime import datetime
+from Bio import SeqIO, SeqRecord, Seq
+from itertools import islice
+from collections import Counter
+from tqdm import tqdm
+
+# --- External Tool Imports ---
+# NOTE: This script requires 'mappy' and 'regex' to be installed via pip or conda
+try:
+    import mappy as mp
+    import regex
+    USE_FUZZY_MATCH = True
+except ImportError:
+    print("WARNING: Mappy (Minimap2) and Regex not installed. Alignment and fuzzy barcode matching will fail.")
+    # Define placeholder class to allow the rest of the script to run without crashing
+    class mp:
+        Aligner = object
+        def __init__(self, *args, **kwargs): pass
+    USE_FUZZY_MATCH = False
+
+# ==============================================================================
+# 1. READ FILTERING FUNCTIONS
+# ==============================================================================
+
+def run_stream_filtering_with_resume(input_fastq_gz, output_filtered_fastq_gz, checkpoint_path,
+                                     log_csv_path, min_size, max_size, batch_size, stop_after_reads):
+    """Filters reads by size using streaming I/O with checkpointing."""
+    start_read = 0
+    if os.path.exists(checkpoint_path):
+        with open(checkpoint_path, "r") as f:
+            start_read = int(f.read().strip())
+        tqdm.write(f"🔁 Resuming filtering from checkpoint: {start_read:,} reads processed.")
+
+    total_reads = start_read
+    filtered_reads = 0 if start_read == 0 else None
+    reads_to_process = stop_after_reads - start_read
+
+    try:
+        with gzip.open(input_fastq_gz, 'rt') as in_handle:
+            read_iter = islice(SeqIO.parse(in_handle, 'fastq'), start_read, None)
+
+            # Use a unique part file name for merging later
+            part_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+            temp_output_path = output_filtered_fastq_gz.replace('.gz', f'.part_{part_tag}.gz')
+            
+            with gzip.open(temp_output_path, 'wt') as out_handle:
+                with tqdm(total=reads_to_process, initial=0, desc="Filtering Reads") as pbar:
+                    while total_reads < stop_after_reads:
+                        current_batch_size = min(batch_size, stop_after_reads - total_reads)
+                        batch = list(islice(read_iter, current_batch_size))
+
+                        if not batch: break
+
+                        retained = 0
+                        for record in batch:
+                            if min_size <= len(record.seq) <= max_size:
+                                retained += 1
+                                SeqIO.write(record, out_handle, 'fastq')
+
+                        total_reads += len(batch)
+                        pbar.update(len(batch))
+
+                        if filtered_reads is not None:
+                            filtered_reads += retained
+                        else:
+                            filtered_reads = retained 
+
+                        # Save checkpoint
+                        with open(checkpoint_path, "w") as f:
+                            f.write(str(total_reads))
+                        
+                        # Clear buffer for next iteration
+                        batch = []
+                        
+            print(f"\n✅ Done. Total reads processed: {total_reads:,}")
+            if filtered_reads is not None:
+                print(f"✅ Reads retained after filtering: {filtered_reads:,}")
+            return total_reads, filtered_reads, temp_output_path
+            
+    except Exception as e:
+        print(f"FATAL ERROR during filtering: {e}")
+        return total_reads, filtered_reads, None
+
+def merge_filtered_parts(part_path, final_output_path):
+    """Merges all filtered parts into a single final file."""
+    part_prefix = final_output_path.replace(".gz", "")
+    part_files = sorted(glob.glob(part_prefix + ".part_*.gz")) 
+
+    if not part_files:
+        print("⚠️ No part files found to merge.")
+        return 0
+
+    if os.path.exists(final_output_path):
+        os.remove(final_output_path)
+        
+    print(f"\n🧹 Merging {len(part_files)} filtered part files...")
+    
+    total_reads = 0
+    with open(final_output_path, 'wb') as fout:
+        for part in tqdm(part_files, desc="Merging"):
+            with gzip.open(part, 'rb') as f:
+                shutil.copyfileobj(f, fout)
+                
+            # Count reads in the final merged file for validation
+            with gzip.open(part, "rt") as handle:
+                total_reads += sum(1 for _ in SeqIO.parse(handle, "fastq"))
+            
+            os.remove(part) # Clean up part file after merge
+            
+    print(f"\n✅ Final filtered file saved to: {final_output_path}")
+    return total_reads
+
+def validate_fastq_gz(path):
+    """Quickly validates a gzipped FASTQ file by counting reads."""
+    try:
+        with gzip.open(path, "rt") as handle:
+            count = sum(1 for _ in SeqIO.parse(handle, "fastq"))
+        print(f"✅ File validation complete. Total reads: {count:,}")
+        return count
+    except Exception as e:
+        print(f"❌ File validation failed:\n{e}")
+        return 0
+
+# ==============================================================================
+# 2. BARCODE EXTRACTION FUNCTIONS
+# ==============================================================================
+
+# Constants for Barcode Extraction (used in the original script)
+LEFT_FLANK = "TTTTCGCTGGGGCAAACCAG"
+RIGHT_FLANK = "TCAGGCAGGCAAAACCACCC"
+BARCODE_LEN = 21
+MAX_FLANK_ERR = 2
+MOTIF_PATTERN = r"^.{3}A.{2}T.{3}A.{3}A.{2}T.{3}$"
+
+def fuzzy_find(pattern, seq, max_err, start=0):
+    """Uses the regex module for approximate string matching (fuzzy find)."""
+    if not USE_FUZZY_MATCH: return -1, -1
+    
+    # Note: Search starts from 'start' index
+    match = regex.search(f"({pattern}){{e<={max_err}}}", seq, pos=start)
+    if not match:
+        return -1, -1
+    return match.start(), match.end()
+
+def extract_barcode(seq, motif_regex):
+    """Locates fuzzy flanks and extracts a barcode that matches the motif."""
+    l_start, l_end = fuzzy_find(LEFT_FLANK, seq, max_err=MAX_FLANK_ERR)
+    if l_start == -1: return None, "left_flank_not_found"
+
+    r_start, r_end = fuzzy_find(RIGHT_FLANK, seq, max_err=MAX_FLANK_ERR, start=l_end)
+    if r_start == -1: return None, "right_flank_not_found"
+
+    # Define a generous search window between flanks
+    search_start = max(l_end - 10, 0)
+    search_end = min(r_start + 10, len(seq))
+    window = seq[search_start:search_end]
+
+    # Search for the motif within the window
+    for i in range(len(window) - BARCODE_LEN + 1):
+        candidate = window[i:i + BARCODE_LEN]
+        if motif_regex.match(candidate):
+            return candidate, None
+            
+    return None, "motif_not_found"
+
+def run_barcode_extraction(input_fastq, output_prefix, max_reads):
+    """Performs batch-based barcode extraction with checkpointing."""
+    if not USE_FUZZY_MATCH:
+        print("❌ Barcode extraction skipped. 'regex' module is required.")
+        return 0, 0
+        
+    MOTIF_REGEX = regex.compile(MOTIF_PATTERN.replace(".", "[ATGC]")) # Compile motif
+    
+    # Define file paths
+    csv_out = output_prefix + "_barcodes_extracted.csv"
+    barcode_counts_out = output_prefix + "_barcode_counts.csv"
+    checkpoint_file = output_prefix + ".checkpoint.json"
+    reads_fastq_out = output_prefix + "_barcodes_reads.fastq.gz" 
+    
+    start_idx = 0
+    barcodes_list = []
+    
+    # Checkpoint setup
+    if os.path.exists(checkpoint_file):
+        with open(checkpoint_file, "r") as f:
+            checkpoint = json.load(f)
+            start_idx = checkpoint.get("last_read", 0)
+        print(f"Resuming extraction from read {start_idx:,}")
+    else:
+        with open(csv_out, "w", newline="") as csvfile:
+            csv.writer(csvfile).writerow(["read_id", "barcode"])
+        # Initialize the FASTQ files if they don't exist
+        with gzip.open(reads_fastq_out, "wt") as fq_out: pass
+
+    # Extraction loop
+    barcode_rows = []
+    read_records = []
+    rejected = Counter()
+    BATCH_SIZE = 50000 
+    
+    with gzip.open(input_fastq, "rt") as handle, \
+         open(csv_out, "a", newline="") as csvfile, \
+         gzip.open(reads_fastq_out, "at") as fq_out:
+        
+        csv_writer = csv.writer(csvfile)
+        
+        for i, record in enumerate(tqdm(SeqIO.parse(handle, "fastq"), total=max_reads, desc="Extracting Barcodes")):
+            if i < start_idx: continue
+            if i >= max_reads: break
+            
+            seq = str(record.seq)
+            barcode, reason = extract_barcode(seq, MOTIF_REGEX)
+            
+            if barcode is not None:
+                barcodes_list.append(barcode)
+                # Prepare record for writing to file
+                record.id = f"{record.id}|barcode={barcode}"
+                record.description = ""
+                
+                barcode_rows.append([record.id, barcode])
+                read_records.append(record)
+            else:
+                rejected[reason] += 1
+
+            if len(barcode_rows) >= BATCH_SIZE:
+                # Write batch
+                csv_writer.writerows(barcode_rows)
+                SeqIO.write(read_records, fq_out, "fastq")
+                
+                # Checkpoint
+                with open(checkpoint_file, "w") as f:
+                    json.dump({"last_read": i + 1}, f)
+                
+                barcode_rows.clear()
+                read_records.clear()
+        
+        # Final write of remaining records
+        if barcode_rows:
+            csv_writer.writerows(barcode_rows)
+            SeqIO.write(read_records, fq_out, "fastq")
+
+    # Final statistics
+    barcode_counts = Counter(barcodes_list)
+    num_total = len(barcodes_list)
+    num_unique = len(barcode_counts)
+
+    with open(barcode_counts_out, "w", newline="") as bc_csv:
+        bc_writer = csv.writer(bc_csv)
+        bc_writer.writerow(["barcode", "count"])
+        for bc, cnt in barcode_counts.items():
+            bc_writer.writerow([bc, cnt])
+
+    print(f"\nTotal reads processed: {i + 1:,}")
+    print(f"Barcodes successfully extracted: {num_total:,}")
+    print(f"Unique barcodes found: {num_unique:,}")
+    print("Top rejection reasons:", dict(rejected.most_common(3)))
+    
+    return num_total, num_unique
+
+# ==============================================================================
+# 3. MAPPY ALIGNMENT FUNCTIONS
+# ==============================================================================
+
+def extract_position(seq_id):
+    """Extracts position number (1-6) from the reference FASTA header."""
+    for field in seq_id.split('|'):
+        if field.startswith('Position:'):
+            pos = field.replace('Position:', '').strip()
+            return "4+5" if pos in ("4", "5", "4+5") else pos
+    return None
+
+def prepare_references(reference_fasta, ref_dir):
+    """Splits the multi-FASTA reference into per-position files for Mappy."""
+    sequences_by_position = {}
+    os.makedirs(ref_dir, exist_ok=True)
+    
+    with open(reference_fasta) as fh:
+        seq_id = None; seq = []
+        for line in fh:
+            line = line.strip()
+            if line.startswith('>'):
+                if seq_id:
+                    pos = extract_position(seq_id)
+                    if pos: sequences_by_position.setdefault(pos, []).append((seq_id, ''.join(seq)))
+                seq_id = line[1:]; seq = []
+            else:
+                seq.append(line)
+        if seq_id:
+            pos = extract_position(seq_id)
+            if pos: sequences_by_position.setdefault(pos, []).append((seq_id, ''.join(seq)))
+
+    ref_files = {}
+    for pos, entries in sequences_by_position.items():
+        outp = os.path.join(ref_dir, f'position_{pos}.fa')
+        with open(outp, 'w') as outfh:
+            for sid, sseq in entries:
+                outfh.write(f'>{sid}\n{sseq}\n')
+        ref_files[pos] = outp
+    return ref_files
+
+def initialize_aligners(ref_files):
+    """Initializes a Mappy Aligner object for each reference position."""
+    if 'mp' not in globals(): raise RuntimeError("Mappy module not available.")
+    aligners = {}
+    for pos, path in ref_files.items():
+        # Use 'map-ont' preset for Nanopore data
+        aln = mp.Aligner(path, preset='map-ont') 
+        if not aln: raise RuntimeError(f"Failed to load aligner for position {pos}")
+        aligners[pos] = aln
+    return aligners
+
+def align_read_to_all_positions(seq_id, seq_seq, aligners):
+    """Aligns one read against all reference positions (1-6) with quality filtering."""
+    result = {'Seq ID': seq_id}
+    
+    for pos in ("1","2","3","4","5","6"):
+        key = "4+5" if pos in ("4","5") else pos 
+        aln = aligners.get(key)
+        
+        result[f'Position {pos} Reference'] = 'No match found'
+        result[f'Position {pos} Accuracy (%)'] = 0.0
+        result[f'Position {pos} Coverage (%)'] = 0.0
+
+        if not aln: continue
+
+        for hit in aln.map(seq_seq):
+            ref_len = len(aln.seq(hit.ctg))
+            if hit.blen == 0 or ref_len == 0: continue
+            
+            acc = 100.0 * hit.mlen / hit.blen
+            cov = 100.0 * hit.blen / ref_len
+            
+            if acc > 90.0 and cov > 90.0:
+                result[f'Position {pos} Reference'] = hit.ctg
+                result[f'Position {pos} Accuracy (%)'] = round(acc, 2)
+                result[f'Position {pos} Coverage (%)'] = round(cov, 2)
+                break
+    return result
+
+def run_mappy_alignment(input_fastq, aligners, out_full_csv, out_inc_csv, total_reads=None):
+    """Processes all barcoded reads, aligns them, and saves full/incomplete results."""
+    if not aligners: return Counter()
+    open_func = gzip.open if input_fastq.endswith('.gz') else open
+    
+    with open_func(input_fastq, 'rt') as handle:
+        iterator = SeqIO.parse(handle, 'fastq')
+        iterator = tqdm(iterator, total=total_reads, desc="Aligning Reads to Assembly")
+
+        results_full = []
+        results_inc = []
+        counts = Counter()
+
+        for rec in iterator:
+            res = align_read_to_all_positions(rec.id, str(rec.seq), aligners)
+            
+            matched = sum(
+                res[f'Position {pos} Reference'] != 'No match found'
+                for pos in ("1", "2", "3", "4", "5", "6")
+            )
+            res['Positions_Matched'] = matched
+            counts[matched] += 1
+
+            if matched == 6:
+                results_full.append(res)
+            else:
+                results_inc.append(res)
+
+        # Final write
+        pd.DataFrame(results_full).to_csv(out_full_csv, index=False)
+        pd.DataFrame(results_inc).to_csv(out_inc_csv, index=False)
+    
+    return counts
+
+# ==============================================================================
+# 4. ASSEMBLY SUMMARY AND MAPPING FUNCTIONS
+# ==============================================================================
+
+def run_assembly_summary(align_full_csv, barcode_counts_csv, out_clean_mapping_csv, out_summary_csv):
+    """Filters alignments to clean barcodes and creates final assembly summary tables."""
+    
+    # 1. Load full alignments and clean up columns
+    df = pd.read_csv(align_full_csv)
+    df['read_id'] = df['Seq ID'].str.split('|').str[0]
+    df['barcode'] = df['Seq ID'].str.extract(r'barcode=([ACGT]+)')
+
+    # Identify the 6 “Position X Reference” columns in order
+    pos_ref_cols = sorted(
+        [c for c in df.columns if re.match(r'Position \d Reference', c)],
+        key=lambda x: int(re.search(r'Position (\d)', x).group(1))
+    )
+
+    # Build an "assembly" string per read (for QC)
+    df['assembly'] = df[pos_ref_cols].apply(lambda r: ';'.join(r.values.astype(str)), axis=1)
+
+    # 2. Filter to "clean" barcodes (exactly 1 distinct assembly per barcode)
+    assemblies_per_bc = df.groupby('barcode')['assembly'].nunique()
+    clean_barcodes = assemblies_per_bc[assemblies_per_bc == 1].index
+    df_clean = df[df['barcode'].isin(clean_barcodes)].copy()
+
+    # 3. Prepare clean read-to-parts mapping
+    pattern = re.compile(r'Position (\d)')
+    rename_parts = {col: f"Part{pattern.search(col).group(1)}" for col in pos_ref_cols}
+
+    mapping = (
+        df_clean[['read_id', *pos_ref_cols, 'barcode']]
+        .rename(columns={**rename_parts, 'barcode':'Barcode'})
+    )
+    mapping.to_csv(out_clean_mapping_csv, index=False)
+    print(f"✅ Clean read-to-parts mapping saved: {out_clean_mapping_csv}")
+
+    # 4. Create final assembly summary (one row per assembly, listing all barcodes)
+    grp = mapping.groupby(list(rename_parts.values()))['Barcode'].apply(list).reset_index()
+    
+    # Expand the list of barcodes into separate columns
+    max_bcs = grp['Barcode'].str.len().max()
+    expanded = pd.DataFrame(
+        grp['Barcode'].tolist(),
+        columns=[f"Barcode {i+1}" for i in range(max_bcs)]
+    )
+    summary = pd.concat([grp.drop(columns=['Barcode']), expanded], axis=1)
+    summary.to_csv(out_summary_csv, index=False)
+    print(f"✅ Final assembly summary table saved: {out_summary_csv}")
+
+    return df_clean, summary
+    
+# ==============================================================================
+# 5. MAIN EXECUTION BLOCK
+# ==============================================================================
+
+def main_pipeline_run():
+    # --------------------------------------------------------------------------
+    # A) USER-DEFINED PATHS AND GLOBAL PARAMETERS (UPDATE THESE)
+    # --------------------------------------------------------------------------
+    # --- IMPORTANT: Change this BASE_DIR to your project folder ---
+    BASE_DIR = "/content/nanopore_analysis_project/" 
+    
+    # Input files (assuming they are placed in BASE_DIR/raw/)
+    RAW_INPUT_FASTQ = os.path.join(BASE_DIR, "raw/Sample1.fastq.gz")
+    REFERENCE_FASTA = os.path.join(BASE_DIR, "references/GGS2_Reference_of_parts.fasta")
+    
+    # Output file paths
+    FILTERED_OUTPUT_FASTQ = os.path.join(BASE_DIR, "processed/GGS2_Library_Filtered.fastq.gz")
+    BARCODE_OUTPUT_PREFIX = os.path.join(BASE_DIR, "processed/GGS2_Nano_Barcodes")
+    ALIGNMENT_FULL_CSV = os.path.join(BASE_DIR, "results/GGS2_Combined_Align_Full.csv")
+    ALIGNMENT_INC_CSV = os.path.join(BASE_DIR, "results/GGS2_Combined_Align_Incomplete.csv")
+    FINAL_MAPPING_CSV = os.path.join(BASE_DIR, "results/GGS2_Clean_ReadID_Parts_Barcodes.csv")
+    FINAL_SUMMARY_CSV = os.path.join(BASE_DIR, "results/GGS2_Clean_Assembly_Summary_Table.csv")
+    
+    # Checkpoint and temporary directories
+    CHECKPOINT_FILTER = os.path.join(BASE_DIR, "logs/checkpoint_filter.txt")
+    REF_TEMP_DIR = "/tmp/ggs_refs" # Must be writable (local or /tmp)
+
+    # Global Parameters
+    TOTAL_RAW_READS = 9077231  
+    MIN_SIZE, MAX_SIZE = 3000, 12000
+    
+    # --------------------------------------------------------------------------
+    # B) SETUP
+    # --------------------------------------------------------------------------
+    print("--- Setting up Project Directories ---")
+    for d in [os.path.join(BASE_DIR, "raw"), os.path.join(BASE_DIR, "processed"), 
+              os.path.join(BASE_DIR, "results"), os.path.join(BASE_DIR, "references"),
+              os.path.join(BASE_DIR, "logs"), REF_TEMP_DIR]:
+        os.makedirs(d, exist_ok=True)
+    
+    print("-" * 40)
+    
+    # --------------------------------------------------------------------------
+    # STEP 1: READ LENGTH FILTERING
+    # --------------------------------------------------------------------------
+    # You must place the RAW_INPUT_FASTQ file at the path defined above to run this step.
+    
+    total_processed, total_retained, part_output_path = run_stream_filtering_with_resume(
+        input_fastq_gz=RAW_INPUT_FASTQ,
+        output_filtered_fastq_gz=FILTERED_OUTPUT_FASTQ,
+        checkpoint_path=CHECKPOINT_FILTER,
+        log_csv_path=os.path.join(BASE_DIR, "logs/filter_summary.csv"),
+        stop_after_reads=TOTAL_RAW_READS,
+        min_size=MIN_SIZE, max_size=MAX_SIZE
+    )
+    
+    # Merge parts and validate
+    if total_processed > 0:
+        merge_filtered_parts(
+            part_path=FILTERED_OUTPUT_FASTQ,
+            final_output_path=FILTERED_OUTPUT_FASTQ
+        )
+    
+    retained_reads = validate_fastq_gz(FILTERED_OUTPUT_FASTQ)
+    
+    # --------------------------------------------------------------------------
+    # STEP 2: BARCODE EXTRACTION
+    # --------------------------------------------------------------------------
+    if retained_reads > 0:
+        total_extracted, unique_extracted = run_barcode_extraction(
+            input_fastq=FILTERED_OUTPUT_FASTQ,
+            output_prefix=BARCODE_OUTPUT_PREFIX,
+            max_reads=retained_reads
+        )
+        print(f"\nTotal reads passed to alignment: {total_extracted:,}")
+    else:
+        print("\nSkipping Barcode Extraction/Alignment: No reads retained after filtering.")
+        return 
+        
+    # --------------------------------------------------------------------------
+    # STEP 3: ASSEMBLY ALIGNMENT (Requires mappy)
+    # --------------------------------------------------------------------------
+    try:
+        if USE_FUZZY_MATCH and os.path.exists(BARCODE_OUTPUT_PREFIX + "_barcodes_reads.fastq.gz"):
+            print("\nStarting Mappy Alignment...")
+            
+            # 1. Prepare and initialize aligners
+            ref_files = prepare_references(REFERENCE_FASTA, REF_TEMP_DIR)
+            aligners = initialize_aligners(ref_files)
+
+            # 2. Run alignment on the barcoded reads
+            barcoded_reads_fastq = BARCODE_OUTPUT_PREFIX + "_barcodes_reads.fastq.gz"
+            
+            counts = run_mappy_alignment(
+                input_fastq=barcoded_reads_fastq,
+                aligners=aligners,
+                out_full_csv=ALIGNMENT_FULL_CSV,
+                out_inc_csv=ALIGNMENT_INC_CSV,
+                total_reads=total_extracted
+            )
+            print("Alignment Finished.")
+        else:
+             print("\nSkipping Alignment: Mappy is unavailable or barcode FASTQ was not created.")
+
+    except Exception as e:
+        print(f"\n❌ FATAL Alignment Error: {e}")
+        return
+        
+    # --------------------------------------------------------------------------
+    # STEP 4: FINAL SUMMARY AND MAPPING
+    # --------------------------------------------------------------------------
+    if os.path.exists(ALIGNMENT_FULL_CSV):
+        df_clean, summary = run_assembly_summary(
+            align_full_csv=ALIGNMENT_FULL_CSV,
+            barcode_counts_csv=BARCODE_OUTPUT_PREFIX + "_barcode_counts.csv",
+            out_clean_mapping_csv=FINAL_MAPPING_CSV,
+            out_summary_csv=FINAL_SUMMARY_CSV
+        )
+        print("-" * 40)
+        print("Pipeline successfully completed all steps.")
+    else:
+        print("\nSkipping Final Summary: Full alignment CSV not found.")
+
+if __name__ == "__main__":
+    main_pipeline_run()

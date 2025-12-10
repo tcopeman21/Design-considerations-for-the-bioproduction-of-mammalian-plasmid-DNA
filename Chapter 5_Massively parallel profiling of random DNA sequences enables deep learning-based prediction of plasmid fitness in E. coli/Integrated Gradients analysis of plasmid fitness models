@@ -1,92 +1,79 @@
 """
-Run Integrated Gradients on a trained GCN model to identify
-sequence regions and motifs contributing to plasmid fitness predictions.
-
-Inputs:
-- models/gcn_best.pt
-- data/sequences.npz
-
-Outputs:
-- results/ig_attributions.npz
-- results/top_kmers.csv
+Run Integrated Gradients (IG) on a trained CNN model to identify
+sequence regions and k-mers that contribute most strongly to predicted fitness.
 """
 
 import os
 import numpy as np
-import pandas as pd
-from collections import Counter
+import torch
+from captum.attr import IntegratedGradients
 from tqdm import tqdm
 
-import torch
-import torch.nn as nn
-from captum.attr import IntegratedGradients
-
-from train_gcn import GCN  # model definition only
-
 # Config
-MODEL_PATH = "models/gcn_best.pt"
-DATA_NPZ = "data/sequences.npz"
-
-IG_OUT = "results/ig_attributions.npz"
-KMER_OUT = "results/top_kmers.csv"
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH = 64
-STEPS = 10
-K = 6
+SEQ_LEN = 192
+ALPHABET = ["A", "C", "G", "T"]
 
 # Load model
-model = GCN().to(DEVICE)
-model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-model.eval()
+def load_model(model_cls, checkpoint_path):
+    model = model_cls()
+    model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
+    model.to(DEVICE)
+    model.eval()
+    return model
 
-# Load data
-data = np.load(DATA_NPZ)
-seqs = data["sequences"][:, 1:-1, :].astype(np.float32)  # 192 bp
-targets = data["targets"]
+# Run IG
+def run_integrated_gradients(model, sequences, batch_size=64, n_steps=10):
+    """
+    sequences: (N, 192, 4) numpy array
+    returns:   (N, 192) summed IG attribution per position
+    """
+    ig = IntegratedGradients(model)
+    baseline = torch.zeros((1, SEQ_LEN, 4), device=DEVICE)
 
-seq_tensor = torch.from_numpy(seqs).to(DEVICE)
+    seq_tensor = torch.tensor(sequences, dtype=torch.float32, device=DEVICE)
+    N = seq_tensor.shape[0]
+    attributions = np.zeros((N, SEQ_LEN), dtype=np.float32)
 
-# Integrated Gradients
-ig = IntegratedGradients(model)
-baseline = torch.zeros((1, 192, 4), device=DEVICE)
+    for i in tqdm(range(0, N, batch_size), desc="Integrated Gradients"):
+        batch = seq_tensor[i:i+batch_size]
+        bsz = batch.shape[0]
+        base = baseline.repeat(bsz, 1, 1)
 
-saliency = np.zeros((len(seqs), 192), dtype=np.float32)
+        attr = ig.attribute(
+            batch,
+            baselines=base,
+            n_steps=n_steps,
+            internal_batch_size=bsz
+        )
 
-for i in tqdm(range(0, len(seqs), BATCH)):
-    batch = seq_tensor[i:i+BATCH]
-    b = batch.size(0)
-    attr = ig.attribute(
-        batch,
-        baselines=baseline.repeat(b, 1, 1),
-        n_steps=STEPS,
-    )
-    saliency[i:i+b] = attr.sum(dim=2).detach().cpu().numpy()
+        attr_sum = attr.sum(dim=2).detach().cpu().numpy()
+        attributions[i:i+batch_size] = attr_sum
 
-# Save IG
-np.savez_compressed(
-    IG_OUT,
-    ig_positional=saliency,
-    targets=targets,
-)
-print("IG saved:", IG_OUT)
+    return attributions
 
-# Extract top k-mers
-def extract_kmer(seq, pos, k=6):
+# k-mer extraction
+def extract_kmers(seqs, attr, k=6):
+    """
+    Extract k-mers centred on the max-attribution position.
+    """
     half = k // 2
-    start = max(0, pos - half)
-    end = start + k
-    return seq[start:end] if end <= len(seq) else None
+    kmers = []
 
-raw_seqs = data["raw_sequences"]  # optional if provided
+    for s, a in zip(seqs, attr):
+        idx = int(np.argmax(a))
+        start = max(0, idx - half)
+        end   = start + k
+        if end <= len(s):
+            kmers.append(s[start:end])
 
-kmers = []
-for i in range(len(saliency)):
-    pos = int(np.argmin(saliency[i]))
-    kmer = extract_kmer(raw_seqs[i], pos)
-    if kmer:
-        kmers.append(kmer)
+    return kmers
 
-counts = Counter(kmers)
-pd.DataFrame(counts.most_common(50), columns=["kmer", "count"]).to_csv(KMER_OUT, index=False)
-print("Top k-mers saved:", KMER_OUT)
+
+if __name__ == "__main__":
+    raise RuntimeError(
+        "This script expects:\n"
+        "  - A trained model checkpoint\n"
+        "  - One-hot encoded sequences (N×192×4)\n"
+        "Provide these via a wrapper script in reproducibility/."
+    )

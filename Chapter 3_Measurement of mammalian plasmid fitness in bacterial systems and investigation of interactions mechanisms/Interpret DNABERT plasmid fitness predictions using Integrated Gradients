@@ -1,0 +1,399 @@
+"""
+Run Integrated Gradients on a trained DNABERT-S + pairwise ranker model.
+
+Pipeline:
+  1. Load plasmid sequences + LFC.
+  2. Load DNABERT-S and the trained PairwiseRanker head.
+  3. Wrap into FullFitnessModel for IG (FWD + REV embeddings).
+  4. For each plasmid:
+       - Run IG on FWD+REV k-mers.
+       - Build per-base saliency on the forward sequence.
+       - Extract top-k 6-mers and hotspot bases.
+  5. Save IG_TopKmers.csv and IG_hotspots.csv in results/.
+  6. Generate summary plots (k-mer logos, GC content, σ⁷⁰-like matches, orientation).
+
+NOTE:
+  This script assumes your training setup is the same as in train_pairwise_ranker_dnabert.py.
+"""
+
+import os
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from Bio.Seq import Seq
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoModel
+from captum.attr import IntegratedGradients
+from scipy.stats import mannwhitneyu, chi2_contingency
+import seaborn as sns
+
+# 1. CONFIG
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
+
+SEQ_CSV_PATH   = os.path.join(BASE_DIR, "data", "input", "Plasmid_LFC_Summary_with_Sequences.example.csv")
+MODEL_WEIGHTS_PATH = os.path.join(BASE_DIR, "results", "pairwise_ranker_weights.pth")
+
+TOPK_CSV_PATH     = os.path.join(BASE_DIR, "results", "IG_TopKmers.csv")
+HOTSPOT_CSV_PATH  = os.path.join(BASE_DIR, "results", "IG_hotspots.csv")
+SAL_MAP_DIR       = os.path.join(BASE_DIR, "figures", "saliency_maps")
+
+os.makedirs(os.path.dirname(TOPK_CSV_PATH), exist_ok=True)
+os.makedirs(SAL_MAP_DIR, exist_ok=True)
+
+MODEL_NAME = "zhihan1996/DNABERT-S"
+KMERSIZE   = 6
+MAX_LEN    = 512
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 2. SHARED UTILITIES / MODELS
+def seq_to_kmers(seq: str, k: int = KMERSIZE) -> str:
+    """Convert a sequence to space-separated k-mers."""
+    if len(seq) < k:
+        seq = seq + "A" * (k - len(seq))
+    return " ".join(seq[i:i + k] for i in range(len(seq) - k + 1))
+
+
+class PairwiseRanker(nn.Module):
+    """Same architecture as in train_pairwise_ranker_dnabert.py."""
+    def __init__(self, input_dim: int, drop_prob: float = 0.3):
+        super().__init__()
+        self.score_fn = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(drop_prob),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor):
+        s1 = self.score_fn(x1).squeeze(-1)
+        s2 = self.score_fn(x2).squeeze(-1)
+        return s1, s2
+
+
+class FullFitnessModel(nn.Module):
+    """
+    Wrap DNABERT-S + ranker.score_fn for Integrated Gradients on embeddings.
+    Inputs:
+      emb_f, emb_r   : [B, L, H] embeddings for FWD/REV
+      mask_f, mask_r : attention masks
+    """
+    def __init__(self, bert: AutoModel, ranker: PairwiseRanker):
+        super().__init__()
+        self.bert = bert
+        self.head = ranker.score_fn
+
+    def forward(self, emb_f, emb_r, mask_f, mask_r):
+        out_f = self.bert(inputs_embeds=emb_f, attention_mask=mask_f).last_hidden_state
+        out_r = self.bert(inputs_embeds=emb_r, attention_mask=mask_r).last_hidden_state
+
+        pf = torch.cat([out_f[:, 0], out_f.mean(1), out_f.max(1)[0]], dim=1)
+        pr = torch.cat([out_r[:, 0], out_r.mean(1), out_r.max(1)[0]], dim=1)
+
+        return self.head(torch.cat([pf, pr], dim=1)).squeeze(-1)
+
+# 3. IG CORE
+def interpret_with_ig_and_saliency(
+    pid: str,
+    seq: str,
+    tokenizer: AutoTokenizer,
+    bert: AutoModel,
+    full_model: nn.Module,
+    top_k: int = 10,
+    n_steps: int = 20,
+    internal_batch_size: int = 4,
+) -> Tuple[List[Tuple[str, float]], np.ndarray]:
+    """
+    Run IG on both strands, build forward-strand per-base saliency and return:
+      - top_k kmers from FWD (token, IG score)
+      - per-base saliency array over FWD sequence
+    """
+    km_f = seq_to_kmers(seq)
+    km_r = seq_to_kmers(str(Seq(seq).reverse_complement()))
+
+    inp_f = tokenizer(km_f, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LEN).to(device)
+    inp_r = tokenizer(km_r, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LEN).to(device)
+
+    emb_layer = bert.get_input_embeddings()
+    e_f = emb_layer(inp_f.input_ids).requires_grad_()
+    e_r = emb_layer(inp_r.input_ids).requires_grad_()
+
+    ig = IntegratedGradients(full_model)
+    (a_f, a_r), delta = ig.attribute(
+        (e_f, e_r),
+        baselines=(torch.zeros_like(e_f), torch.zeros_like(e_r)),
+        additional_forward_args=(inp_f.attention_mask, inp_r.attention_mask),
+        n_steps=n_steps,
+        internal_batch_size=internal_batch_size,
+        return_convergence_delta=True,
+    )
+
+    def get_scores(attr, inp_ids):
+        toks = tokenizer.convert_ids_to_tokens(inp_ids[0])
+        scores = attr[0].sum(dim=1).detach().cpu().numpy()
+        clean = [(t, float(s)) for t, s in zip(toks, scores) if len(t) == KMERSIZE and set(t) <= set("ACGT")]
+        clean_sorted = sorted(clean, key=lambda x: abs(x[1]), reverse=True)
+        return clean_sorted, scores
+
+    topk_fwd, scores_f = get_scores(a_f, inp_f.input_ids)
+
+    # Per-base saliency for FWD
+    L = len(seq)
+    sal = np.zeros(L, dtype=float)
+    cnt = np.zeros(L, dtype=int)
+    for idx, sc in enumerate(scores_f):
+        for pos in range(idx, min(idx + KMERSIZE, L)):
+            sal[pos] += sc
+            cnt[pos] += 1
+    sal[cnt > 0] /= cnt[cnt > 0]
+
+    del e_f, e_r, a_f, a_r
+    torch.cuda.empty_cache()
+
+    return topk_fwd[:top_k], sal
+
+
+def extract_hotspots(
+    pid: str,
+    sal: np.ndarray,
+    lfc: float,
+    quantile: float = 0.95,
+) -> List[dict]:
+    """Extract base positions where |saliency| ≥ given quantile."""
+    abs_sal = np.abs(sal)
+    cutoff = np.quantile(abs_sal, quantile)
+    rows = []
+    for i, s in enumerate(sal):
+        if abs(s) >= cutoff:
+            rows.append(
+                {
+                    "Plasmid": pid,
+                    "Strand": "FWD",
+                    "Position": i + 1,
+                    "Saliency": float(s),
+                    "Average_LFC_DH5a": float(lfc),
+                }
+            )
+    return rows
+
+# 4. MAIN IG RUNNER
+def run_ig():
+    # --- load plasmid data ---
+    df = pd.read_csv(SEQ_CSV_PATH)
+    required_cols = {"Plasmid", "DNA_sequence", "Average_LFC_DH5a"}
+    if not required_cols.issubset(df.columns):
+        raise ValueError(f"Input CSV must contain columns: {required_cols}")
+    df = df[list(required_cols)].dropna()
+    df = df.rename(columns={"Average_LFC_DH5a": "LFC"})
+    df = df.set_index("Plasmid")
+
+    # --- load DNABERT + ranker ---
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    bert = AutoModel.from_pretrained(MODEL_NAME).to(device).eval()
+    hidden_size = bert.config.hidden_size
+    input_dim = 6 * hidden_size  # [CLS + mean + max] for FWD + REV
+
+    ranker = PairwiseRanker(input_dim=input_dim).to(device)
+    ranker.load_state_dict(torch.load(MODEL_WEIGHTS_PATH, map_location=device))
+    ranker.eval()
+
+    full_model = FullFitnessModel(bert, ranker).to(device).eval()
+
+    print(f"Loaded model + weights. Running IG for {len(df)} plasmids...")
+
+    topk_rows = []
+    hotspot_rows = []
+
+    for pid, row in tqdm(df.iterrows(), total=len(df), desc="IG per plasmid"):
+        seq = str(row["DNA_sequence"])
+        lfc = float(row["LFC"])
+
+        topk_fwd, sal_fwd = interpret_with_ig_and_saliency(
+            pid, seq, tokenizer, bert, full_model
+        )
+
+        # Save saliency map figure per plasmid
+        plt.figure(figsize=(8, 2))
+        plt.bar(range(len(seq)), sal_fwd, width=1.0)
+        plt.title(f"{pid} – FWD saliency")
+        plt.xlabel("Base position")
+        plt.ylabel("IG attribution")
+        plt.tight_layout()
+        plt.savefig(os.path.join(SAL_MAP_DIR, f"{pid}_saliency.png"))
+        plt.close()
+
+        # Collect top-k 6-mers
+        for km, sc in topk_fwd:
+            topk_rows.append(
+                {
+                    "Plasmid": pid,
+                    "Strand": "FWD",
+                    "Top_kmer": km,
+                    "IG_score": sc,
+                }
+            )
+
+        # Collect hotspots
+        hotspot_rows.extend(extract_hotspots(pid, sal_fwd, lfc))
+
+    pd.DataFrame(topk_rows).to_csv(TOPK_CSV_PATH, index=False)
+    pd.DataFrame(hotspot_rows).to_csv(HOTSPOT_CSV_PATH, index=False)
+
+    print(f"✅ Saved Top-k 6-mers → {TOPK_CSV_PATH}")
+    print(f"✅ Saved hotspots → {HOTSPOT_CSV_PATH}")
+    print(f"✅ Saved saliency PNGs → {SAL_MAP_DIR}")
+
+# 5. DOWNSTREAM ANALYSIS / PLOTS
+def classify_kmers(topk_df: pd.DataFrame):
+    """Classify 6-mers as HIGH or LOW based on mean IG score."""
+    kmer_means = topk_df.groupby("Top_kmer")["IG_score"].mean()
+    kmer_class = kmer_means.apply(lambda x: "HIGH" if x > 0 else "LOW")
+    topk_df["IG_class"] = topk_df["Top_kmer"].map(kmer_class)
+    return topk_df, kmer_class
+
+
+def plot_sequence_logo(kmers: List[str], title: str):
+    """Simple logo-like frequency plot (no external logomaker)."""
+    df_mat = pd.DataFrame([list(k) for k in kmers])
+    freq = df_mat.apply(lambda col: col.value_counts(normalize=True)).fillna(0)
+    positions = np.arange(1, df_mat.shape[1] + 1)
+
+    plt.figure(figsize=(6, 3))
+    for base in "ACGT":
+        if base in freq.index:
+            plt.plot(positions, freq.loc[base], marker="o", label=base)
+    plt.title(title)
+    plt.xlabel("Position (1–6)")
+    plt.ylabel("Frequency")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_gc_and_sigma70(topk_df: pd.DataFrame, kmer_class: pd.Series):
+    """GC content + σ⁷⁰ -10/-35 match stats for HIGH vs LOW kmers."""
+    def count_matches(kmer: str, motif: str) -> int:
+        return sum(1 for a, b in zip(kmer, motif) if a == b)
+
+    cons_10 = "TATAAT"
+    cons_35 = "TTGACA"
+
+    gc = lambda s: (s.count("G") + s.count("C")) / len(s)
+
+    kmers = kmer_class.index
+    classified = pd.DataFrame(
+        {
+            "kmer": kmers,
+            "class": kmer_class.values,
+            "gc": [gc(k) for k in kmers],
+            "match_10": [count_matches(k, cons_10) for k in kmers],
+            "match_35": [count_matches(k, cons_35) for k in kmers],
+        }
+    )
+
+    # Tests
+    u_gc = mannwhitneyu(
+        classified[classified["class"] == "LOW"]["gc"],
+        classified[classified["class"] == "HIGH"]["gc"],
+        alternative="two-sided",
+    )
+    u_10 = mannwhitneyu(
+        classified[classified["class"] == "LOW"]["match_10"],
+        classified[classified["class"] == "HIGH"]["match_10"],
+        alternative="greater",
+    )
+    u_35 = mannwhitneyu(
+        classified[classified["class"] == "LOW"]["match_35"],
+        classified[classified["class"] == "HIGH"]["match_35"],
+        alternative="greater",
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+    sns.boxplot(
+        data=classified,
+        x="class",
+        y="gc",
+        palette={"LOW": "#f4cccc", "HIGH": "#d9ead3"},
+        ax=axes[0],
+    )
+    axes[0].set_title(f"GC content (p = {u_gc.pvalue:.2e})")
+    axes[0].set_ylabel("GC fraction")
+
+    sns.boxplot(
+        data=classified,
+        x="class",
+        y="match_10",
+        palette={"LOW": "#f4cccc", "HIGH": "#d9ead3"},
+        ax=axes[1],
+    )
+    axes[1].set_title(f"-10 motif match (p = {u_10.pvalue:.1e})")
+    axes[1].set_ylabel("Matches to TATAAT")
+
+    sns.boxplot(
+        data=classified,
+        x="class",
+        y="match_35",
+        palette={"LOW": "#f4cccc", "HIGH": "#d9ead3"},
+        ax=axes[2],
+    )
+    axes[2].set_title(f"-35 motif match (p = {u_35.pvalue:.1e})")
+    axes[2].set_ylabel("Matches to TTGACA")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_orientation_bias(topk_df: pd.DataFrame):
+    """Orientation (strand) bias for HIGH vs LOW kmers."""
+    orient_table = pd.crosstab(topk_df["IG_class"], topk_df["Strand"])
+    chi2_stat, chi2_pval, _, _ = chi2_contingency(orient_table)
+
+    orient_table = orient_table.div(orient_table.sum(axis=1), axis=0)
+
+    plt.figure(figsize=(4, 3))
+    orient_table.plot(
+        kind="bar",
+        stacked=False,
+        color=["#A2CFFE", "#FFD8B1"],
+        ax=plt.gca(),
+    )
+    plt.title(f"Orientation bias (Chi² p = {chi2_pval:.2e})")
+    plt.ylabel("Fraction")
+    plt.tight_layout()
+    plt.show()
+
+
+def run_plots():
+    if not os.path.exists(TOPK_CSV_PATH):
+        raise FileNotFoundError(f"Top-k CSV not found: {TOPK_CSV_PATH}")
+    topk_df = pd.read_csv(TOPK_CSV_PATH)
+
+    topk_df, kmer_class = classify_kmers(topk_df)
+
+    # Logos for “top 10 low” and “top 10 high”
+    agg = topk_df.groupby("Top_kmer")["IG_score"].mean().reset_index()
+    neg10 = agg.nsmallest(10, "IG_score")["Top_kmer"].tolist()
+    pos10 = agg.nlargest(10, "IG_score")["Top_kmer"].tolist()
+
+    plot_sequence_logo(neg10, "Top 10 Low-IG 6-mers")
+    plot_sequence_logo(pos10, "Top 10 High-IG 6-mers")
+
+    plot_gc_and_sigma70(topk_df, kmer_class)
+    plot_orientation_bias(topk_df)
+
+# 6. MAIN
+def main():
+    run_ig()
+    run_plots()
+
+
+if __name__ == "__main__":
+    main()
+

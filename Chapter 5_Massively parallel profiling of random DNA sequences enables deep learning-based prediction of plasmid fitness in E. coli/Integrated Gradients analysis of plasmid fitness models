@@ -1,0 +1,92 @@
+"""
+Run Integrated Gradients on a trained GCN model to identify
+sequence regions and motifs contributing to plasmid fitness predictions.
+
+Inputs:
+- models/gcn_best.pt
+- data/sequences.npz
+
+Outputs:
+- results/ig_attributions.npz
+- results/top_kmers.csv
+"""
+
+import os
+import numpy as np
+import pandas as pd
+from collections import Counter
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+from captum.attr import IntegratedGradients
+
+from train_gcn import GCN  # model definition only
+
+# Config
+MODEL_PATH = "models/gcn_best.pt"
+DATA_NPZ = "data/sequences.npz"
+
+IG_OUT = "results/ig_attributions.npz"
+KMER_OUT = "results/top_kmers.csv"
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH = 64
+STEPS = 10
+K = 6
+
+# Load model
+model = GCN().to(DEVICE)
+model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+model.eval()
+
+# Load data
+data = np.load(DATA_NPZ)
+seqs = data["sequences"][:, 1:-1, :].astype(np.float32)  # 192 bp
+targets = data["targets"]
+
+seq_tensor = torch.from_numpy(seqs).to(DEVICE)
+
+# Integrated Gradients
+ig = IntegratedGradients(model)
+baseline = torch.zeros((1, 192, 4), device=DEVICE)
+
+saliency = np.zeros((len(seqs), 192), dtype=np.float32)
+
+for i in tqdm(range(0, len(seqs), BATCH)):
+    batch = seq_tensor[i:i+BATCH]
+    b = batch.size(0)
+    attr = ig.attribute(
+        batch,
+        baselines=baseline.repeat(b, 1, 1),
+        n_steps=STEPS,
+    )
+    saliency[i:i+b] = attr.sum(dim=2).detach().cpu().numpy()
+
+# Save IG
+np.savez_compressed(
+    IG_OUT,
+    ig_positional=saliency,
+    targets=targets,
+)
+print("IG saved:", IG_OUT)
+
+# Extract top k-mers
+def extract_kmer(seq, pos, k=6):
+    half = k // 2
+    start = max(0, pos - half)
+    end = start + k
+    return seq[start:end] if end <= len(seq) else None
+
+raw_seqs = data["raw_sequences"]  # optional if provided
+
+kmers = []
+for i in range(len(saliency)):
+    pos = int(np.argmin(saliency[i]))
+    kmer = extract_kmer(raw_seqs[i], pos)
+    if kmer:
+        kmers.append(kmer)
+
+counts = Counter(kmers)
+pd.DataFrame(counts.most_common(50), columns=["kmer", "count"]).to_csv(KMER_OUT, index=False)
+print("Top k-mers saved:", KMER_OUT)

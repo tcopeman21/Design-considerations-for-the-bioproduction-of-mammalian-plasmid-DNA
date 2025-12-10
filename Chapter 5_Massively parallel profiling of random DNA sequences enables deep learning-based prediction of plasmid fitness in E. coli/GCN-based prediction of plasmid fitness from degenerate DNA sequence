@@ -1,0 +1,171 @@
+"""
+Train a convolutional neural network (GCN-style U-Net) to predict plasmid
+fitness from one-hot encoded DNA sequences.
+
+Inputs:
+- data/sequences.npz  (arrays: sequences [N,194,4], targets [N])
+
+Outputs:
+- models/gcn_best.pt
+- results/predictions.csv
+"""
+
+import os
+import random
+import pickle
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+# ---------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------
+DATA_NPZ = "data/sequences.npz"
+MODEL_OUT = "models/gcn_best.pt"
+PRED_OUT = "results/predictions.csv"
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 512
+EPOCHS = 50
+LR = 1e-3
+WEIGHT_DECAY = 3e-4
+SEED = 42
+
+os.makedirs("models", exist_ok=True)
+os.makedirs("results", exist_ok=True)
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+# Model
+class Encoder(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_ch, out_ch, 3, padding=1)
+        self.bn1 = nn.BatchNorm1d(out_ch)
+        self.conv2 = nn.Conv1d(out_ch, out_ch, 5, padding=2)
+        self.bn2 = nn.BatchNorm1d(out_ch)
+        self.conv3 = nn.Conv1d(out_ch, out_ch, 7, stride=2, padding=3)
+
+    def forward(self, x, downsample=True):
+        x = F.relu(self.conv1(x))
+        res = x
+        x = self.bn1(x)
+        x = F.relu(self.conv2(x))
+        x = self.bn2(x)
+        x = x + res
+        return F.relu(self.conv3(x)) if downsample else x, x
+
+
+class Decoder(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.deconv = nn.ConvTranspose1d(in_ch, out_ch, 2, stride=2)
+        self.conv = nn.Conv1d(in_ch + out_ch, out_ch, 5, padding=2)
+        self.bn = nn.BatchNorm1d(out_ch)
+
+    def forward(self, x, skip):
+        x = F.relu(self.deconv(x))
+        x = torch.cat([x, skip], dim=1)
+        return self.bn(F.relu(self.conv(x)))
+
+
+class GCN(nn.Module):
+    def __init__(self, hidden=128):
+        super().__init__()
+        self.enc1 = Encoder(4, hidden)
+        self.enc2 = Encoder(hidden, hidden)
+        self.enc3 = Encoder(hidden, hidden)
+        self.middle1 = Encoder(hidden, hidden)
+        self.middle2 = Encoder(hidden, hidden)
+        self.dec1 = Decoder(hidden, hidden)
+        self.dec2 = Decoder(hidden, hidden)
+        self.dec3 = Decoder(hidden, hidden)
+
+        self.fc = nn.Sequential(
+            nn.Linear(192 * hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x, s1 = self.enc1(x)
+        x, s2 = self.enc2(x)
+        x, s3 = self.enc3(x)
+        x, _ = self.middle1(x, downsample=False)
+        x, _ = self.middle2(x, downsample=False)
+        x = self.dec1(x, s3)
+        x = self.dec2(x, s2)
+        x = self.dec3(x, s1)
+        x = x.permute(0, 2, 1)
+        return self.fc(torch.flatten(x, 1))
+
+# Load data
+data = np.load(DATA_NPZ)
+seqs = data["sequences"][:, 1:-1, :]   # 194 → 192
+targets = data["targets"].astype(np.float32)
+
+dataset = list(zip(seqs.astype(np.float32), targets))
+random.shuffle(dataset)
+
+split = int(0.8 * len(dataset))
+train_data = dataset[:split]
+test_data = dataset[split:]
+
+train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(test_data, batch_size=BATCH_SIZE)
+
+# Training
+model = GCN().to(DEVICE)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+criterion = nn.HuberLoss()
+
+best_val = np.inf
+
+for epoch in range(EPOCHS):
+    model.train()
+    for x, y in train_loader:
+        x = x.to(DEVICE)
+        y = y.unsqueeze(1).to(DEVICE)
+        optimizer.zero_grad()
+        loss = criterion(model(x), y)
+        loss.backward()
+        optimizer.step()
+
+    model.eval()
+    val_losses = []
+    with torch.no_grad():
+        for x, y in test_loader:
+            x = x.to(DEVICE)
+            y = y.unsqueeze(1).to(DEVICE)
+            val_losses.append(criterion(model(x), y).item())
+
+    val_loss = np.mean(val_losses)
+    if val_loss < best_val:
+        best_val = val_loss
+        torch.save(model.state_dict(), MODEL_OUT)
+
+    print(f"Epoch {epoch+1}/{EPOCHS} | val loss = {val_loss:.4f}")
+
+# Final prediction export
+model.load_state_dict(torch.load(MODEL_OUT))
+model.eval()
+
+preds, trues = [], []
+with torch.no_grad():
+    for x, y in test_loader:
+        preds.extend(model(x.to(DEVICE)).squeeze().cpu().numpy())
+        trues.extend(y.numpy())
+
+pd.DataFrame({"actual": trues, "predicted": preds}).to_csv(PRED_OUT, index=False)
+print("Predictions saved:", PRED_OUT)
+

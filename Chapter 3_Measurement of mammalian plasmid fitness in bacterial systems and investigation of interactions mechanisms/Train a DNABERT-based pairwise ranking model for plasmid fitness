@@ -1,0 +1,405 @@
+"""
+Train a DNABERT-S–based pairwise ranking model on plasmid fitness.
+
+Pipeline:
+  1. Load plasmid sequences + Average_LFC_DH5a from CSV.
+  2. Build forward + reverse-complement DNABERT-S embeddings:
+     [CLS, mean, max] for each strand → concat to one vector per plasmid.
+  3. Train a pairwise ranking head with K-fold CV using margin ranking loss.
+  4. Save best model weights to disk.
+"""
+
+import os
+from typing import Tuple, List
+
+import numpy as np
+import pandas as pd
+from Bio.Seq import Seq
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from transformers import AutoTokenizer, AutoModel
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold
+from scipy.stats import spearmanr
+import matplotlib.pyplot as plt
+
+# 1. CONFIGURATION
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
+
+# --- Input / output paths (EDIT these for your repo layout) ---
+SEQ_CSV_PATH = os.path.join(BASE_DIR, "data", "input", "Plasmid_LFC_Summary_with_Sequences.example.csv")
+MODEL_WEIGHTS_PATH = os.path.join(BASE_DIR, "results", "pairwise_ranker_weights.pth")
+TRAINING_CURVES_PNG = os.path.join(BASE_DIR, "figures", "pairwise_training_curves.png")
+PRED_VS_TRUE_PNG = os.path.join(BASE_DIR, "figures", "pairwise_pred_vs_true.png")
+
+os.makedirs(os.path.dirname(MODEL_WEIGHTS_PATH), exist_ok=True)
+os.makedirs(os.path.dirname(TRAINING_CURVES_PNG), exist_ok=True)
+os.makedirs(os.path.dirname(PRED_VS_TRUE_PNG), exist_ok=True)
+
+# --- DNABERT / model hyperparameters ---
+MODEL_NAME = "zhihan1996/DNABERT-S"
+KMERSIZE   = 6
+MAX_LEN    = 512
+BATCH_EMB  = 16      # embedding batch size
+BATCH_PW   = 64      # pairwise training batch size
+LR         = 1e-3
+EPOCHS     = 10
+FOLDS      = 5
+MARGIN     = 0.5
+DROP_PROB  = 0.3
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 2. MODEL DEFINITIONS
+def seq_to_kmers(seq: str, k: int = KMERSIZE) -> str:
+    """Convert a DNA sequence into a space-separated k-mer string."""
+    if len(seq) < k:
+        seq = seq + "A" * (k - len(seq))
+    return " ".join(seq[i:i + k] for i in range(len(seq) - k + 1))
+
+
+class PairwiseDataset(Dataset):
+    """All non-equal pairs for pairwise ranking loss."""
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.pairs: List[Tuple[np.ndarray, np.ndarray]] = []
+        self.labels: List[float] = []
+        n = len(X)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if y[i] == y[j]:
+                    continue
+                self.pairs.append((X[i], X[j]))
+                self.labels.append(float(y[i] > y[j]))
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int):
+        a, b = self.pairs[idx]
+        return (
+            torch.from_numpy(a).float(),
+            torch.from_numpy(b).float(),
+            torch.tensor(self.labels[idx], dtype=torch.float32),
+        )
+
+
+class PairwiseRanker(nn.Module):
+    """
+    Feed-forward head that maps an embedding vector to a scalar fitness score.
+    """
+    def __init__(self, input_dim: int, drop_prob: float = DROP_PROB):
+        super().__init__()
+        self.score_fn = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(drop_prob),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor):
+        s1 = self.score_fn(x1).squeeze(-1)
+        s2 = self.score_fn(x2).squeeze(-1)
+        return s1, s2
+
+# 3. EMBEDDING FUNCTIONS
+def embed_one_sequence(
+    seq: str,
+    tokenizer: AutoTokenizer,
+    model: AutoModel,
+    device: torch.device,
+) -> np.ndarray:
+    """
+    Embed a single DNA sequence with DNABERT-S as:
+        concat([CLS], mean, max) → 3H vector.
+    """
+    kmer_str = seq_to_kmers(seq)
+    inputs = tokenizer(
+        kmer_str,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=MAX_LEN,
+    ).to(device)
+
+    with torch.no_grad():
+        out = model(**inputs).last_hidden_state  # [1, L, H]
+
+    cls = out[:, 0, :]           # [1, H]
+    mean = out.mean(dim=1)       # [1, H]
+    maxv = out.max(dim=1)[0]     # [1, H]
+
+    emb = torch.cat([cls, mean, maxv], dim=1).squeeze(0)  # [3H]
+    return emb.detach().cpu().numpy().astype(np.float32)
+
+
+def embed_sequence_pair(
+    seq_fwd: str,
+    seq_rev: str,
+    tokenizer: AutoTokenizer,
+    model: AutoModel,
+    device: torch.device,
+) -> np.ndarray:
+    """
+    Compute [3H_fwd, 3H_rev] concatenated into a 6H embedding per plasmid.
+    """
+    e_f = embed_one_sequence(seq_fwd, tokenizer, model, device)
+    e_r = embed_one_sequence(seq_rev, tokenizer, model, device)
+    return np.concatenate([e_f, e_r], axis=0)
+
+
+def prepare_embeddings() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load plasmid CSV, build fwd+rev embeddings, return:
+        X       : [N, 6H] DNABERT-derived embeddings
+        y_norm  : [N] normalised LFC
+        y_raw   : [N] raw LFC
+    """
+    print(f"Loading plasmid data from: {SEQ_CSV_PATH}")
+    df = pd.read_csv(SEQ_CSV_PATH)
+    required_cols = {"Plasmid", "DNA_sequence", "Average_LFC_DH5a"}
+    if not required_cols.issubset(df.columns):
+        raise ValueError(f"Input CSV must contain columns: {required_cols}")
+
+    df = df[list(required_cols)].dropna()
+    df = df.rename(columns={"Average_LFC_DH5a": "LFC"})
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    bert = AutoModel.from_pretrained(MODEL_NAME).to(device).eval()
+    hidden_size = bert.config.hidden_size
+    print(f"Loaded {MODEL_NAME} (hidden size={hidden_size}) on device={device}")
+
+    X, y = [], []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Embedding plasmids"):
+        seq_fwd = str(row["DNA_sequence"])
+        seq_rev = str(Seq(seq_fwd).reverse_complement())
+        emb = embed_sequence_pair(seq_fwd, seq_rev, tokenizer, bert, device)
+        X.append(emb)
+        y.append(row["LFC"])
+
+    X = np.vstack(X)
+    y = np.array(y, dtype=float)
+
+    scaler = StandardScaler()
+    y_norm = scaler.fit_transform(y.reshape(-1, 1)).ravel()
+
+    print(f"✅ Embeddings shape: {X.shape} | Normalised LFC shape: {y_norm.shape}")
+    return X, y_norm, y
+
+# 4. TRAINING + PLOTS
+def train_pairwise_ranker(X: np.ndarray, y_norm: np.ndarray) -> Tuple[PairwiseRanker, dict]:
+    """
+    Train a pairwise ranker with K-fold CV.
+    Returns:
+        best_model  : trained PairwiseRanker with best Spearman
+        history     : dict with loss/acc/spearman per epoch per fold
+    """
+    kf = KFold(n_splits=FOLDS, shuffle=True, random_state=42)
+
+    all_train_losses = []
+    all_val_accs = []
+    all_spears = []
+    all_best_epochs = []
+
+    best_model = None
+    best_score = -np.inf
+
+    for fold, (ti, vi) in enumerate(kf.split(X), start=1):
+        print(f"\n--- Fold {fold}/{FOLDS} ---")
+        Xtr, Xva = X[ti], X[vi]
+        ytr, yva = y_norm[ti], y_norm[vi]
+
+        train_loader = DataLoader(PairwiseDataset(Xtr, ytr), batch_size=BATCH_PW, shuffle=True)
+        val_loader = DataLoader(PairwiseDataset(Xva, yva), batch_size=BATCH_PW)
+
+        model = PairwiseRanker(X.shape[1]).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=LR)
+
+        fold_train_losses = []
+        fold_val_accs = []
+        fold_spears = []
+        best_fold_score = -np.inf
+        best_epoch = 0
+
+        for ep in range(1, EPOCHS + 1):
+            # ---- Train ----
+            model.train()
+            total_loss = 0.0
+            for x1, x2, lb in train_loader:
+                x1, x2, lb = x1.to(device), x2.to(device), lb.to(device)
+                s1, s2 = model(x1, x2)
+                loss = F.margin_ranking_loss(s1, s2, 2 * lb - 1, margin=MARGIN)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                total_loss += loss.item()
+            avg_loss = total_loss / len(train_loader)
+            fold_train_losses.append(avg_loss)
+
+            # ---- Validation accuracy ----
+            model.eval()
+            correct, total = 0, 0
+            with torch.no_grad():
+                for x1, x2, lb in val_loader:
+                    x1, x2, lb = x1.to(device), x2.to(device), lb.to(device)
+                    p1, p2 = model(x1, x2)
+                    preds = (p1 > p2).float()
+                    correct += (preds == lb).sum().item()
+                    total += len(lb)
+            acc = correct / total if total > 0 else np.nan
+            fold_val_accs.append(acc)
+
+            # ---- Spearman on raw scores ----
+            with torch.no_grad():
+                raw_scores = model.score_fn(
+                    torch.tensor(Xva, dtype=torch.float32).to(device)
+                ).squeeze().cpu().numpy()
+            sp = spearmanr(raw_scores, yva).correlation
+            fold_spears.append(sp)
+
+            # Selection criterion: Spearman + 0.5 * accuracy
+            sel = (sp if sp is not None else 0.0) + 0.5 * (acc if not np.isnan(acc) else 0.0)
+            if sel > best_fold_score:
+                best_fold_score = sel
+                best_epoch = ep
+
+            if sel > best_score:
+                best_score = sel
+                best_model = model
+
+            print(f"  Epoch {ep:02d} | loss={avg_loss:.4f} | acc={acc:.3f} | spearman={sp:.3f}")
+
+        print(f"Fold {fold} best epoch: {best_epoch} (sel={best_fold_score:.3f})")
+        all_train_losses.append(fold_train_losses)
+        all_val_accs.append(fold_val_accs)
+        all_spears.append(fold_spears)
+        all_best_epochs.append(best_epoch)
+
+    history = {
+        "train_losses": all_train_losses,
+        "val_accs": all_val_accs,
+        "spears": all_spears,
+        "best_epochs": all_best_epochs,
+    }
+
+    best_fold_spears = [max(s) for s in all_spears]
+    print(f"\n📊 Average (max) Spearman R over folds: {np.mean(best_fold_spears):.4f} ± {np.std(best_fold_spears):.4f}")
+
+    return best_model, history
+
+
+def plot_training_history(history: dict, out_path: str):
+    """Plot mean ± std for loss, val acc, and Spearman across folds."""
+    train_losses = np.array(history["train_losses"])
+    val_accs = np.array(history["val_accs"])
+    spears = np.array(history["spears"])
+    best_epochs = np.array(history["best_epochs"])
+
+    epochs = train_losses.shape[1]
+    xs = np.arange(1, epochs + 1)
+    avg_best = best_epochs.mean()
+
+    plt.figure(figsize=(12, 4), dpi=300)
+
+    # Loss
+    ax = plt.subplot(1, 3, 1)
+    ax.plot(xs, train_losses.mean(axis=0))
+    ax.fill_between(xs,
+                    train_losses.mean(axis=0) - train_losses.std(axis=0),
+                    train_losses.mean(axis=0) + train_losses.std(axis=0),
+                    alpha=0.2)
+    ax.axvline(avg_best, color="k", ls="--", label=f"Avg best ≈ {avg_best:.1f}")
+    ax.set_title("Training Loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.grid(True)
+    ax.legend()
+
+    # Accuracy
+    ax = plt.subplot(1, 3, 2)
+    ax.plot(xs, val_accs.mean(axis=0))
+    ax.fill_between(xs,
+                    val_accs.mean(axis=0) - val_accs.std(axis=0),
+                    val_accs.mean(axis=0) + val_accs.std(axis=0),
+                    alpha=0.2)
+    ax.axvline(avg_best, color="k", ls="--")
+    ax.set_title("Validation Accuracy")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Accuracy")
+    ax.grid(True)
+
+    # Spearman
+    ax = plt.subplot(1, 3, 3)
+    ax.plot(xs, spears.mean(axis=0))
+    ax.fill_between(xs,
+                    spears.mean(axis=0) - spears.std(axis=0),
+                    spears.mean(axis=0) + spears.std(axis=0),
+                    alpha=0.2)
+    ax.axvline(avg_best, color="k", ls="--")
+    ax.set_title("Spearman R")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Spearman")
+    ax.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(out_path, bbox_inches="tight")
+    plt.close()
+    print(f"Saved training curves → {out_path}")
+
+
+def plot_pred_vs_true(
+    model: PairwiseRanker,
+    X: np.ndarray,
+    y_norm: np.ndarray,
+    out_path: str,
+):
+    """Scatter of predicted vs actual (normalised LFC) on all data."""
+    model.eval()
+    with torch.no_grad():
+        preds = model.score_fn(
+            torch.tensor(X, dtype=torch.float32).to(device)
+        ).squeeze().cpu().numpy()
+
+    lo = float(min(y_norm.min(), preds.min()))
+    hi = float(max(y_norm.max(), preds.max()))
+
+    plt.figure(figsize=(5, 5), dpi=300)
+    plt.scatter(y_norm, preds, alpha=0.6, s=18)
+    plt.plot([lo, hi], [lo, hi], "k--", linewidth=1)
+    plt.xlabel("Normalised actual LFC")
+    plt.ylabel("Predicted score")
+    plt.title("Pairwise Ranker: Predicted vs Actual (All plasmids)")
+    plt.xlim(lo, hi)
+    plt.ylim(lo, hi)
+    try:
+        plt.gca().set_box_aspect(1)
+    except Exception:
+        plt.gca().set_aspect("equal", adjustable="box")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out_path, bbox_inches="tight")
+    plt.close()
+    print(f"Saved predicted vs actual plot → {out_path}")
+
+# 5. MAIN
+def main():
+    X, y_norm, y_raw = prepare_embeddings()
+    best_model, history = train_pairwise_ranker(X, y_norm)
+
+    # Save model
+    torch.save(best_model.state_dict(), MODEL_WEIGHTS_PATH)
+    print(f"✅ Saved best model weights → {MODEL_WEIGHTS_PATH}")
+
+    # Plots
+    plot_training_history(history, TRAINING_CURVES_PNG)
+    plot_pred_vs_true(best_model, X, y_norm, PRED_VS_TRUE_PNG)
+
+
+if __name__ == "__main__":
+    main()
+

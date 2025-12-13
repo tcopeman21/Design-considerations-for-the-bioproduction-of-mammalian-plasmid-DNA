@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+import numpy as np
+import torch
+from transformers import AutoTokenizer, AutoModel
+
+try:
+    from Bio.Seq import Seq  # optional (for reverse complement)
+except Exception:
+    Seq = None
+
+# Config
+@dataclass
+class EmbedConfig:
+    model_name: str = "zhihan1996/DNABERT-S"
+    k: int = 6
+
+    # sliding window over *k-mers* (not bases)
+    window_kmers: int = 128
+    stride_kmers: int = 64
+
+    # tokenizer max length in tokens (DNABERT expects <=512 typically)
+    max_len: int = 512
+
+    # embedding batch size over windows
+    batch_emb: int = 16
+
+    # device
+    device: Optional[str] = None  # "cuda" / "cpu" / None -> auto
+
+# K-mer utilities
+
+def seq_to_kmers(seq: str, k: int) -> str:
+    seq = str(seq).strip().upper()
+    if len(seq) < k:
+        seq = seq + "A" * (k - len(seq))
+    return " ".join(seq[i : i + k] for i in range(len(seq) - k + 1))
+
+
+def sliding_window_kmer_chunks(
+    seq: str,
+    k: int,
+    window_kmers: int,
+    stride_kmers: int,
+) -> List[str]:
+    kmers = seq_to_kmers(seq, k).split()
+    if len(kmers) == 0:
+        return []
+
+    chunks: List[str] = []
+    # standard sliding windows
+    for i in range(0, len(kmers) - window_kmers + 1, stride_kmers):
+        chunks.append(" ".join(kmers[i : i + window_kmers]))
+
+    # ensure last window is included (if sequence is longer than one window)
+    if len(kmers) > window_kmers:
+        chunks.append(" ".join(kmers[-window_kmers:]))
+
+    # if sequence shorter than window, keep a single chunk
+    if len(chunks) == 0:
+        chunks = [" ".join(kmers)]
+
+    return chunks
+
+
+def reverse_complement(seq: str) -> str:
+    if Seq is None:
+        raise ImportError("Biopython is required for reverse-complement (pip install biopython).")
+    return str(Seq(str(seq).upper()).reverse_complement())
+
+# DNABERT-S embedder
+
+class DNABERTSEmbedder:
+    def __init__(self, cfg: EmbedConfig):
+        self.cfg = cfg
+
+        dev = cfg.device
+        if dev is None:
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(dev)
+
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+        self.model = AutoModel.from_pretrained(cfg.model_name).to(self.device)
+        self.model.eval()
+
+        self.hidden_size = int(self.model.config.hidden_size)
+        self.out_dim = 3 * self.hidden_size  # CLS + mean + max
+
+    @torch.no_grad()
+    def embed_strand(self, seq: str) -> np.ndarray:
+        """
+        Returns a single vector of shape [3H] for one strand by:
+        - chunking into k-mer windows
+        - running DNABERT per chunk
+        - pooling (CLS, mean, max) per chunk -> [3H]
+        - averaging across chunks
+        """
+        cfg = self.cfg
+        chunks = sliding_window_kmer_chunks(
+            seq=seq,
+            k=cfg.k,
+            window_kmers=cfg.window_kmers,
+            stride_kmers=cfg.stride_kmers,
+        )
+
+        if len(chunks) == 0:
+            # fall back to a minimal padded sequence
+            chunks = [seq_to_kmers(seq, cfg.k)]
+
+        embs: List[np.ndarray] = []
+
+        for i in range(0, len(chunks), cfg.batch_emb):
+            batch = chunks[i : i + cfg.batch_emb]
+
+            inp = self.tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=cfg.max_len,
+            )
+            inp = {k: v.to(self.device) for k, v in inp.items()}
+
+            out = self.model(**inp).last_hidden_state  # [B, L, H]
+
+            cls = out[:, 0, :]          # [B, H]
+            mn = out.mean(dim=1)        # [B, H]
+            mx = out.max(dim=1)[0]      # [B, H]
+
+            pooled = torch.cat([cls, mn, mx], dim=1)   # [B, 3H]
+            embs.append(pooled.detach().cpu().numpy().astype(np.float32))
+
+        all_chunks = np.vstack(embs)  # [n_chunks, 3H]
+        return all_chunks.mean(axis=0).astype(np.float32)
+
+    @torch.no_grad()
+    def embed_sequence(self, seq: str, include_revcomp: bool = True) -> np.ndarray:
+        """
+        If include_revcomp:
+            returns [6H] = [3H forward || 3H reverse-complement]
+        Else:
+            returns [3H] = [3H forward]
+        """
+        fwd = self.embed_strand(seq)
+
+        if not include_revcomp:
+            return fwd
+
+        rev = self.embed_strand(reverse_complement(seq))
+        return np.concatenate([fwd, rev], axis=0).astype(np.float32)
+
+if __name__ == "__main__":
+    # Replace these with your own sequence list / loader.
+    sequences = [
+        "ACGT" * 100,  # example
+        "GATTACA" * 50,
+    ]
+
+    cfg = EmbedConfig(
+        model_name="zhihan1996/DNABERT-S",
+        k=6,
+        window_kmers=128,
+        stride_kmers=64,
+        max_len=512,
+        batch_emb=16,
+        device=None,  # auto
+    )
+
+    emb = DNABERTSEmbedder(cfg)
+
+    X = np.vstack([emb.embed_sequence(s, include_revcomp=True) for s in sequences])
+    print("Embeddings shape:", X.shape)
